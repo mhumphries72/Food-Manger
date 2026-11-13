@@ -1,0 +1,773 @@
+/* Food Manager — a single-file, no-build household food planner.
+   All data lives in this browser's localStorage (see Settings for backup). */
+'use strict';
+
+// ---------- constants ----------
+const KEY = 'foodmanager.v1';
+const CATS = ['Produce', 'Meat & Fish', 'Dairy & Eggs', 'Bakery', 'Pantry', 'Frozen', 'Other'];
+const PERISHABLE = new Set(['Produce', 'Meat & Fish', 'Dairy & Eggs', 'Bakery']);
+const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const FRESH_WARN = 4, FRESH_BAD = 7;      // days since bought
+const LEFT_WARN = 2, LEFT_BAD = 4;        // days since cooked
+const SLOT_LABEL = { leftovers: 'Leftovers night', flex: 'Flex night (use what we have)', out: 'Eating out' };
+
+const UNIT_ALIASES = {
+  cups: 'cup', tablespoon: 'tbsp', tablespoons: 'tbsp', teaspoon: 'tsp', teaspoons: 'tsp',
+  ounce: 'oz', ounces: 'oz', pound: 'lb', pounds: 'lb', lbs: 'lb', grams: 'g', gram: 'g',
+  cans: 'can', cloves: 'clove', slices: 'slice', package: 'pkg', packages: 'pkg',
+  bunches: 'bunch', heads: 'head', sticks: 'stick', jars: 'jar', bags: 'bag',
+};
+const UNITS = new Set(['cup', 'tbsp', 'tsp', 'oz', 'lb', 'g', 'kg', 'ml', 'l', 'can', 'clove', 'slice',
+  'pkg', 'bunch', 'head', 'stick', 'jar', 'bag', 'pinch']);
+
+// First match wins, so specific pantry phrases come before the broad fresh-food words.
+const CAT_WORDS = [
+  ['Frozen', ['frozen']],
+  ['Pantry', ['black pepper', 'tomato sauce', 'tomato paste', 'canned', 'broth', 'stock', 'powder',
+    'peanut butter', 'coconut milk', 'dried', 'crushed tomatoes', 'diced tomatoes', 'beans']],
+  ['Meat & Fish', ['chicken', 'beef', 'pork', 'turkey', 'sausage', 'bacon', 'salmon', 'fish', 'shrimp', 'ham', 'steak', 'lamb', 'tuna']],
+  ['Dairy & Eggs', ['milk', 'cheese', 'butter', 'yogurt', 'cream', 'egg', 'parmesan', 'mozzarella', 'cheddar', 'feta']],
+  ['Bakery', ['bread', 'tortilla', 'bun', 'rolls', 'pita', 'naan', 'bagel']],
+  ['Produce', ['onion', 'garlic', 'tomato', 'lettuce', 'spinach', 'carrot', 'pepper', 'potato', 'broccoli',
+    'lemon', 'lime', 'apple', 'banana', 'cilantro', 'basil', 'parsley', 'celery', 'mushroom', 'zucchini',
+    'cucumber', 'avocado', 'ginger', 'kale', 'cabbage', 'berries', 'scallion', 'squash', 'corn', 'herb',
+    'cauliflower', 'green bean', 'asparagus', 'orange', 'grape', 'salad']],
+  ['Pantry', ['rice', 'pasta', 'flour', 'sugar', 'oil', 'vinegar', 'sauce', 'spice', 'salt', 'cumin', 'paprika',
+    'oregano', 'honey', 'soy', 'noodle', 'lentil', 'oats', 'cereal', 'salsa', 'mustard', 'ketchup', 'mayo',
+    'spaghetti', 'penne', 'quinoa', 'chili', 'cinnamon', 'vanilla', 'nuts', 'coffee', 'tea']],
+];
+
+// ---------- helpers ----------
+const $ = (sel) => document.querySelector(sel);
+const uid = () => Math.random().toString(36).slice(2, 10);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const norm = (s) => String(s).trim().toLowerCase();
+
+const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const fromIso = (s) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
+const today = () => iso(new Date());
+const addDays = (s, n) => { const d = fromIso(s); d.setDate(d.getDate() + n); return iso(d); };
+const daysSince = (s) => Math.round((fromIso(today()) - fromIso(s)) / 86400000);
+const shortDate = (s) => fromIso(s).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+const ago = (n) => (n <= 0 ? 'today' : n === 1 ? '1 day' : `${n} days`);
+
+function weekStartOf(dateIso) {
+  const d = fromIso(dateIso);
+  const diff = (d.getDay() - state.settings.weekStart + 7) % 7;
+  return addDays(dateIso, -diff);
+}
+
+function fmtQty(q) {
+  if (q == null) return '';
+  const r = Math.round(q * 100) / 100;
+  return String(r);
+}
+
+function guessCat(name) {
+  const n = norm(name);
+  for (const [cat, words] of CAT_WORDS) if (words.some((w) => n.includes(w))) return cat;
+  return 'Other';
+}
+
+function parseQty(s) {
+  const fr = { '½': 0.5, '¼': 0.25, '¾': 0.75, '⅓': 1 / 3, '⅔': 2 / 3 };
+  let total = 0, ok = false;
+  for (const p of s.trim().split(/\s+/)) {
+    if (fr[p] != null) { total += fr[p]; ok = true; }
+    else if (/^\d+\/\d+$/.test(p)) { const [a, b] = p.split('/').map(Number); if (b) { total += a / b; ok = true; } }
+    else if (/^\d*\.?\d+$/.test(p)) { total += parseFloat(p); ok = true; }
+  }
+  return ok ? total : null;
+}
+
+// "1 1/2 cups rice" -> { qty: 1.5, unit: 'cup', name: 'rice', cat: 'Pantry' }
+function parseIngredient(line) {
+  const m = line.trim().match(/^((?:\d+\/\d+|\d*\.?\d+|[½¼¾⅓⅔])(?:\s+(?:\d+\/\d+|[½¼¾⅓⅔]))?)?\s*(.*)$/);
+  const qty = m[1] ? parseQty(m[1]) : null;
+  let rest = m[2].trim();
+  let unit = '';
+  const words = rest.split(/\s+/);
+  if (qty != null && words.length > 1) {
+    const w = norm(words[0]).replace(/\.$/, '');
+    const u = UNIT_ALIASES[w] || w;
+    if (UNITS.has(u)) { unit = u; rest = words.slice(1).join(' ').replace(/^of\s+/i, ''); }
+  }
+  return { qty, unit, name: rest, cat: guessCat(rest) };
+}
+const ingredientLine = (i) => [fmtQty(i.qty), i.unit, i.name].filter(Boolean).join(' ');
+
+// Loose match between an ingredient and something on hand ("spinach" ~ "baby spinach").
+function sameFood(a, b) {
+  a = norm(a); b = norm(b);
+  if (!a || !b) return false;
+  return a === b || a.includes(b) || b.includes(a);
+}
+
+// ---------- state ----------
+function defaults() {
+  const staple = (name) => ({ id: uid(), name, cat: guessCat(name), low: false });
+  const recipe = (name, servings, lines, steps) => ({
+    id: uid(), name, servings, ingredients: lines.map(parseIngredient), steps, source: '',
+    rating: null, madeCount: 0, lastMade: null, planServings: null,
+  });
+  return {
+    settings: { servings: 4, weekStart: 0 },
+    recipes: [
+      recipe('Sheet-Pan Chicken & Vegetables', 4,
+        ['1.5 lb chicken thighs', '1 lb potatoes', '2 carrots', '1 head broccoli', '2 tbsp olive oil', '1 tsp paprika', 'salt'],
+        'Heat oven to 425°F. Cut the potatoes and carrots into chunks, toss with oil, paprika and salt on a sheet pan with the chicken. Roast 20 minutes, add broccoli, roast 15 minutes more until the chicken is cooked through.'),
+      recipe('Black Bean Tacos', 4,
+        ['2 can black beans', '8 tortillas', '1 onion', '1 avocado', '1 cup shredded cheese', '1 jar salsa', '1 tsp cumin'],
+        'Soften the chopped onion in a pan, add drained beans and cumin, and warm through, mashing lightly. Serve in warm tortillas with cheese, avocado and salsa.'),
+      recipe('One-Pot Tomato Pasta', 4,
+        ['12 oz penne', '1 can crushed tomatoes', '2 clove garlic', '3 cup baby spinach', '0.5 cup parmesan', '1 tbsp olive oil'],
+        'Cook garlic in oil for a minute. Add tomatoes, pasta and 3 cups water; simmer about 12 minutes, stirring, until the pasta is tender. Stir in spinach until wilted and top with parmesan.'),
+    ],
+    weeks: {},
+    list: [],
+    fresh: [],
+    leftovers: [],
+    staples: ['Milk', 'Eggs', 'Butter', 'Bread', 'Rice', 'Pasta', 'Olive oil', 'Onions', 'Garlic', 'Salt',
+      'Flour', 'Sugar', 'Coffee', 'Cereal'].map(staple),
+    wasteLog: [],
+  };
+}
+
+let state;
+function load() {
+  try {
+    const raw = localStorage.getItem(KEY);
+    state = raw ? Object.assign(defaults(), JSON.parse(raw)) : defaults();
+  } catch (e) {
+    state = defaults();
+  }
+}
+function save() { localStorage.setItem(KEY, JSON.stringify(state)); }
+
+const ui = { tab: 'home', week: null, recipeFilter: 'all', q: '', editStaples: false };
+
+function getWeek(start) {
+  if (!state.weeks[start]) state.weeks[start] = { days: Array(7).fill(null), checkDone: false, listBuilt: false, shopped: false };
+  return state.weeks[start];
+}
+const recipeById = (id) => state.recipes.find((r) => r.id === id);
+const plannedServings = (r) => r.planServings || state.settings.servings;
+const weekLabel = (start) => `${shortDate(start)} – ${shortDate(addDays(start, 6))}`;
+
+// Fresh items a recipe would use up.
+function usesFresh(r) {
+  return state.fresh.filter((f) => r.ingredients.some((i) => sameFood(i.name, f.name)));
+}
+
+// ---------- shopping list ----------
+function buildList() {
+  const wk = getWeek(ui.week);
+  const merged = new Map();
+  for (const d of wk.days) {
+    if (!d || d.type !== 'recipe' || d.cooked) continue;
+    const r = recipeById(d.recipeId);
+    if (!r) continue;
+    const factor = d.servings / (r.servings || 1);
+    for (const i of r.ingredients) {
+      const key = `${norm(i.name)}|${i.unit}`;
+      const e = merged.get(key) || { key, name: i.name, unit: i.unit, qty: null, cat: i.cat, for: [] };
+      if (i.qty != null) e.qty = (e.qty || 0) + i.qty * factor;
+      if (!e.for.includes(r.name)) e.for.push(r.name);
+      merged.set(key, e);
+    }
+  }
+  const previous = new Map(state.list.filter((i) => i.source === 'plan').map((i) => [i.key, i]));
+  const list = state.list.filter((i) => i.source !== 'plan');
+
+  for (const e of merged.values()) {
+    const old = previous.get(e.key);
+    let status = old ? old.status : 'need';
+    let hint = '';
+    if (!old) {
+      // Shop the kitchen first: assume stocked staples and fresh items already on hand.
+      const staple = state.staples.find((s) => sameFood(s.name, e.name));
+      const fresh = state.fresh.find((f) => sameFood(f.name, e.name));
+      if (fresh) { status = 'have'; hint = 'already in the fridge'; }
+      else if (staple && !staple.low) { status = 'have'; hint = 'staple in stock'; }
+    }
+    list.push({ id: old ? old.id : uid(), source: 'plan', status, hint: old ? old.hint : hint, ...e });
+  }
+  for (const s of state.staples.filter((x) => x.low)) {
+    const covered = list.some((i) => i.status !== 'have' && sameFood(i.name, s.name));
+    if (!covered) list.push({ id: uid(), source: 'staple', stapleId: s.id, key: `staple|${s.id}`, name: s.name, unit: '', qty: null, cat: s.cat, status: 'need', for: [] });
+  }
+  state.list = list;
+  wk.listBuilt = true;
+}
+
+function finishShopping() {
+  const bought = state.list.filter((i) => i.status === 'bought');
+  for (const i of bought) {
+    if (PERISHABLE.has(i.cat) && !state.fresh.some((f) => norm(f.name) === norm(i.name))) {
+      state.fresh.push({ id: uid(), name: i.name, added: today() });
+    }
+    const s = state.staples.find((x) => x.id === i.stapleId || sameFood(x.name, i.name));
+    if (s) s.low = false;
+  }
+  state.list = state.list.filter((i) => i.status === 'need');
+  getWeek(ui.week).shopped = true;
+  return bought.length;
+}
+
+function listAsText() {
+  const need = state.list.filter((i) => i.status === 'need');
+  return CATS.map((cat) => {
+    const items = need.filter((i) => i.cat === cat);
+    if (!items.length) return '';
+    return `${cat}\n` + items.map((i) => `- ${[fmtQty(i.qty), i.unit, i.name].filter(Boolean).join(' ')}`).join('\n');
+  }).filter(Boolean).join('\n\n');
+}
+
+// ---------- views ----------
+function ageBadge(days, warn, bad) {
+  const cls = days >= bad ? 'bad' : days >= warn ? 'warn' : '';
+  return `<span class="badge ${cls}">${ago(days)}</span>`;
+}
+
+function dayTitle(d) {
+  if (!d) return '<span class="muted">Nothing planned</span>';
+  if (d.type === 'recipe') {
+    const r = recipeById(d.recipeId);
+    return r ? esc(r.name) : '<span class="muted">Deleted recipe</span>';
+  }
+  return esc(SLOT_LABEL[d.type]);
+}
+
+function viewHome() {
+  const wk = getWeek(ui.week);
+  const planned = wk.days.filter(Boolean).length;
+  const steps = [
+    ['kitchen', 'Kitchen check', 'See what needs using up and which staples are low', wk.checkDone],
+    ['plan', 'Plan the menu', planned ? `${planned} of 7 nights planned` : 'Start with what needs using up', planned >= 5],
+    ['list', 'Build the shopping list', 'Made from the menu, minus what you already have', wk.listBuilt],
+    ['list', 'Shop', 'Check items off in the store, then tap Finish', wk.shopped],
+  ];
+
+  const thisWeek = weekStartOf(today());
+  const idx = Math.round((fromIso(today()) - fromIso(thisWeek)) / 86400000);
+  const tonight = getWeek(thisWeek).days[idx];
+  let tonightHtml;
+  if (!tonight) {
+    tonightHtml = `<p class="empty">Nothing planned for tonight.</p>
+      <div class="actions"><button class="btn" data-action="pick-day" data-week="${thisWeek}" data-idx="${idx}">Choose something</button></div>`;
+  } else if (tonight.type === 'recipe') {
+    const r = recipeById(tonight.recipeId);
+    tonightHtml = `<div class="meal">${dayTitle(tonight)}</div>
+      <small class="muted">${tonight.cooked ? 'Cooked' : `Cooking for ${tonight.servings}`}</small>
+      <div class="actions">
+        ${r ? `<button class="btn" data-action="view-recipe" data-id="${r.id}">Recipe</button>` : ''}
+        ${tonight.cooked ? '' : `<button class="btn primary" data-action="cook" data-week="${thisWeek}" data-idx="${idx}">We cooked it</button>
+        <button class="btn" data-action="move-day" data-week="${thisWeek}" data-idx="${idx}">Not tonight</button>`}
+      </div>`;
+  } else {
+    tonightHtml = `<div class="meal">${dayTitle(tonight)}</div>
+      <div class="actions"><button class="btn" data-action="pick-day" data-week="${thisWeek}" data-idx="${idx}">Change</button></div>`;
+  }
+
+  const urgent = [
+    ...state.leftovers.map((l) => ({ name: l.name, kind: 'Leftovers', days: daysSince(l.made), warn: LEFT_WARN, bad: LEFT_BAD })),
+    ...state.fresh.map((f) => ({ name: f.name, kind: 'Fresh', days: daysSince(f.added), warn: FRESH_WARN, bad: FRESH_BAD })),
+  ].filter((x) => x.days >= x.warn).sort((a, b) => (b.days / b.bad) - (a.days / a.bad));
+
+  const month = today().slice(0, 7);
+  const tossed = state.wasteLog.filter((w) => w.date.startsWith(month)).length;
+
+  return `
+    <h2>Tonight</h2>
+    <div class="card day today">${tonightHtml}</div>
+
+    <h2>Use these first</h2>
+    <div class="card tight">
+      ${urgent.length ? urgent.slice(0, 6).map((x) => `
+        <div class="row"><div class="grow"><b>${esc(x.name)}</b><span class="sub">${x.kind}</span></div>${ageBadge(x.days, x.warn, x.bad)}</div>`).join('')
+      : '<p class="empty">Nothing is getting old. Nice work.</p>'}
+    </div>
+    ${urgent.length ? '<button class="btn block" data-tab="kitchen">Open kitchen</button>' : ''}
+
+    <h2>Weekly routine <small>${weekLabel(ui.week)}</small></h2>
+    <div class="card tight">
+      ${steps.map(([tab, title, sub, ok], n) => `
+        <button class="step ${ok ? 'ok' : ''}" data-tab="${tab}">
+          <span class="num">${ok ? '&#10003;' : n + 1}</span>
+          <span><b>${title}</b><br><small class="muted">${sub}</small></span>
+        </button>`).join('')}
+    </div>
+
+    <h2>Food tossed this month</h2>
+    <div class="card"><b>${tossed}</b> item${tossed === 1 ? '' : 's'}
+      <small class="muted"> — tap “Tossed” in Kitchen whenever something is thrown out, so you can see the number shrink.</small></div>`;
+}
+
+function viewPlan() {
+  const wk = getWeek(ui.week);
+  const t = today();
+  const cooked = wk.days.filter((d) => d && d.type === 'recipe').length;
+  const buffer = wk.days.filter((d) => d && (d.type === 'leftovers' || d.type === 'flex')).length;
+  let tip = '';
+  if (cooked >= 6 && !buffer) tip = 'Six or more cooked meals and no leftovers or flex night. Plans change — leaving one or two open nights is the easiest way to waste less.';
+  else if (state.fresh.length && !cooked) tip = `You have ${state.fresh.length} fresh item${state.fresh.length === 1 ? '' : 's'} on hand. Recipes that use them are listed first when you pick a meal.`;
+
+  return `
+    <div class="weeknav">
+      <button class="btn small" data-action="week" data-n="-7">&larr; Prev</button>
+      <b>${weekLabel(ui.week)}</b>
+      <button class="btn small" data-action="week" data-n="7">Next &rarr;</button>
+    </div>
+    ${tip ? `<div class="note">${tip}</div>` : ''}
+    ${wk.days.map((d, i) => {
+      const date = addDays(ui.week, i);
+      const r = d && d.type === 'recipe' ? recipeById(d.recipeId) : null;
+      return `
+      <div class="card day ${date === t ? 'today' : ''} ${d && d.cooked ? 'done' : ''}">
+        <div class="dayname">${DAYS[fromIso(date).getDay()]} · ${shortDate(date)}</div>
+        <div class="meal grow">${dayTitle(d)}</div>
+        ${d && d.type === 'recipe' ? `<small class="muted">${d.cooked ? 'Cooked' : `For ${d.servings}`}</small>` : ''}
+        <div class="actions">
+          <button class="btn small" data-action="pick-day" data-week="${ui.week}" data-idx="${i}">${d ? 'Change' : 'Choose'}</button>
+          ${d ? `<button class="btn small" data-action="move-day" data-week="${ui.week}" data-idx="${i}">Move</button>` : ''}
+          ${r ? `<button class="btn small" data-action="view-recipe" data-id="${r.id}">Recipe</button>` : ''}
+          ${r && !d.cooked ? `<button class="btn small" data-action="servings" data-week="${ui.week}" data-idx="${i}">Servings</button>
+            <button class="btn small primary" data-action="cook" data-week="${ui.week}" data-idx="${i}">Cooked</button>` : ''}
+        </div>
+      </div>`;
+    }).join('')}
+    <button class="btn primary block" data-action="build-list">Build shopping list from this menu</button>`;
+}
+
+function viewList() {
+  const need = state.list.filter((i) => i.status !== 'have');
+  const have = state.list.filter((i) => i.status === 'have');
+  const boughtCount = need.filter((i) => i.status === 'bought').length;
+  const row = (i) => `
+    <div class="row ${i.status === 'bought' ? 'done' : ''}">
+      <button class="check ${i.status === 'bought' ? 'on' : ''}" data-action="toggle-bought" data-id="${i.id}" aria-label="Bought">${i.status === 'bought' ? '&#10003;' : ''}</button>
+      <div class="grow"><b>${esc(i.name)}</b> ${esc([fmtQty(i.qty), i.unit].filter(Boolean).join(' '))}
+        ${i.for && i.for.length ? `<span class="sub">${esc(i.for.join(', '))}</span>` : i.source === 'staple' ? '<span class="sub">Staple running low</span>' : ''}</div>
+      ${i.status === 'need' ? `<button class="btn small" data-action="have" data-id="${i.id}">Have it</button>` : ''}
+    </div>`;
+
+  return `
+    <form class="inline" data-form="add-item">
+      <input type="text" name="name" placeholder="Add an item…" autocomplete="off" required>
+      <button class="btn primary">Add</button>
+    </form>
+    <div class="actions">
+      <button class="btn small" data-action="build-list">Rebuild from menu (${weekLabel(ui.week)})</button>
+      <button class="btn small" data-action="share-list">Share / copy</button>
+    </div>
+    ${need.length ? CATS.map((cat) => {
+      const items = need.filter((i) => i.cat === cat);
+      return items.length ? `<h2>${cat}</h2><div class="card tight">${items.map(row).join('')}</div>` : '';
+    }).join('') : '<p class="empty">The list is empty. Plan a menu, then tap “Rebuild from menu”.</p>'}
+    ${have.length ? `<h2>Already have <small>not on the list — tap to add back</small></h2>
+      <div class="card tight">${have.map((i) => `
+        <div class="row"><div class="grow">${esc(i.name)} ${esc([fmtQty(i.qty), i.unit].filter(Boolean).join(' '))}
+          ${i.hint ? `<span class="sub">${esc(i.hint)}</span>` : ''}</div>
+          <button class="btn small" data-action="need" data-id="${i.id}">Need it</button></div>`).join('')}</div>` : ''}
+    ${boughtCount ? `<button class="btn primary block" data-action="finish-shop">Finish shopping (${boughtCount} bought)</button>` : ''}`;
+}
+
+function recipeMeta(r) {
+  const bits = [];
+  if (r.rating === 'love') bits.push('<span class="badge">Make again</span>');
+  if (r.rating === 'no') bits.push('<span class="badge bad">Not again</span>');
+  bits.push(`<small class="muted">${r.madeCount ? `Made ${r.madeCount}× · last ${shortDate(r.lastMade)}` : 'Not made yet'}</small>`);
+  return bits.join(' ');
+}
+
+function recipeListHtml() {
+  const q = norm(ui.q);
+  const list = state.recipes.filter((r) => {
+    if (ui.recipeFilter === 'love' && r.rating !== 'love') return false;
+    if (ui.recipeFilter === 'new' && r.madeCount) return false;
+    if (ui.recipeFilter === 'all' && r.rating === 'no' && !q) return false;
+    if (ui.recipeFilter === 'no' && r.rating !== 'no') return false;
+    return !q || norm(r.name).includes(q) || r.ingredients.some((i) => norm(i.name).includes(q));
+  }).sort((a, b) => a.name.localeCompare(b.name));
+  if (!list.length) return '<p class="empty">No recipes here yet.</p>';
+  return `<div class="card tight">${list.map((r) => `
+    <div class="row"><div class="grow"><b>${esc(r.name)}</b><span class="sub">${recipeMeta(r)}</span></div>
+      <button class="btn small" data-action="view-recipe" data-id="${r.id}">Open</button></div>`).join('')}</div>`;
+}
+
+function viewRecipes() {
+  const chip = (id, label) => `<button class="chip ${ui.recipeFilter === id ? 'on' : ''}" data-action="recipe-filter" data-id="${id}">${label}</button>`;
+  return `
+    <div class="inline">
+      <input type="search" id="recipe-q" placeholder="Search name or ingredient…" value="${esc(ui.q)}">
+      <button class="btn primary" data-action="new-recipe">New</button>
+    </div>
+    <div class="chips" style="margin:10px 0">${chip('all', 'All')}${chip('love', 'Make again')}${chip('new', 'Not tried')}${chip('no', 'Not again')}</div>
+    <div id="recipe-list">${recipeListHtml()}</div>`;
+}
+
+function viewKitchen() {
+  const wk = getWeek(ui.week);
+  const fresh = [...state.fresh].sort((a, b) => a.added.localeCompare(b.added));
+  const left = [...state.leftovers].sort((a, b) => a.made.localeCompare(b.made));
+  return `
+    <div class="note">Once a week, before planning: look through the fridge, add anything that needs using up, and tap the staples you’re low on.</div>
+
+    <h2>Leftovers <small>eat within ${LEFT_BAD} days</small></h2>
+    <div class="card tight">
+      ${left.length ? left.map((l) => `
+        <div class="row"><div class="grow"><b>${esc(l.name)}</b>${l.portions ? `<span class="sub">${l.portions} portion${l.portions === 1 ? '' : 's'}</span>` : ''}</div>
+          ${ageBadge(daysSince(l.made), LEFT_WARN, LEFT_BAD)}
+          <button class="btn small" data-action="left-done" data-id="${l.id}">Eaten</button>
+          <button class="btn small danger" data-action="left-toss" data-id="${l.id}">Tossed</button></div>`).join('')
+      : '<p class="empty">No leftovers.</p>'}
+    </div>
+    <form class="inline" data-form="add-left"><input type="text" name="name" placeholder="Add leftovers…" autocomplete="off" required><button class="btn">Add</button></form>
+
+    <h2>Fresh food to use up <small>oldest first</small></h2>
+    <div class="card tight">
+      ${fresh.length ? fresh.map((f) => `
+        <div class="row"><div class="grow"><b>${esc(f.name)}</b></div>
+          ${ageBadge(daysSince(f.added), FRESH_WARN, FRESH_BAD)}
+          <button class="btn small" data-action="fresh-done" data-id="${f.id}">Used</button>
+          <button class="btn small danger" data-action="fresh-toss" data-id="${f.id}">Tossed</button></div>`).join('')
+      : '<p class="empty">Nothing listed. Fresh items you buy are added here automatically when you finish shopping.</p>'}
+    </div>
+    <form class="inline" data-form="add-fresh"><input type="text" name="name" placeholder="Add fresh item…" autocomplete="off" required><button class="btn">Add</button></form>
+
+    <h2>Staples <small>tap the ones running low</small></h2>
+    <div class="card">
+      <div class="chips">
+        ${state.staples.map((s) => ui.editStaples
+          ? `<button class="chip" data-action="staple-del" data-id="${s.id}">${esc(s.name)} &times;</button>`
+          : `<button class="chip ${s.low ? 'low' : ''}" data-action="staple-toggle" data-id="${s.id}">${esc(s.name)}</button>`).join('')}
+      </div>
+      <form class="inline" data-form="add-staple" style="margin-top:10px"><input type="text" name="name" placeholder="Add a staple…" autocomplete="off" required><button class="btn">Add</button></form>
+      <div class="actions"><button class="btn small" data-action="staple-edit">${ui.editStaples ? 'Done removing' : 'Remove staples'}</button></div>
+    </div>
+
+    <button class="btn ${wk.checkDone ? '' : 'primary'} block" data-action="check-done">${wk.checkDone ? '&#10003; Kitchen check done for this week' : 'Kitchen check done — plan the menu'}</button>`;
+}
+
+const VIEWS = { home: viewHome, plan: viewPlan, list: viewList, recipes: viewRecipes, kitchen: viewKitchen };
+const TITLES = { home: 'Food Manager', plan: 'Weekly menu', list: 'Shopping list', recipes: 'Recipes', kitchen: 'Kitchen' };
+
+function render() {
+  $('#main').innerHTML = VIEWS[ui.tab]();
+  $('#title').textContent = TITLES[ui.tab];
+  document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === ui.tab));
+}
+function commit() { save(); render(); }
+
+let toastTimer;
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
+}
+
+// ---------- dialogs ----------
+const dialog = () => $('#dialog');
+let onDialogSubmit = null;
+function openDialog(html, onSubmit) {
+  const d = dialog();
+  d.innerHTML = html;
+  onDialogSubmit = onSubmit || null;
+  if (!d.open) d.showModal();
+}
+function closeDialog() { if (dialog().open) dialog().close(); }
+
+function pickDayDialog(week, idx) {
+  const date = addDays(week, idx);
+  const ranked = state.recipes.filter((r) => r.rating !== 'no').map((r) => ({ r, uses: usesFresh(r) }))
+    .sort((a, b) => (b.uses.length - a.uses.length)
+      || ((b.r.rating === 'love') - (a.r.rating === 'love'))
+      || String(a.r.lastMade || '').localeCompare(String(b.r.lastMade || '')));
+  openDialog(`
+    <h3>${DAYS[fromIso(date).getDay()]} ${shortDate(date)}</h3>
+    <div class="chips">
+      <button class="chip" data-action="set-slot" data-type="leftovers" data-week="${week}" data-idx="${idx}">Leftovers night</button>
+      <button class="chip" data-action="set-slot" data-type="flex" data-week="${week}" data-idx="${idx}">Flex night</button>
+      <button class="chip" data-action="set-slot" data-type="out" data-week="${week}" data-idx="${idx}">Eating out</button>
+      <button class="chip" data-action="set-slot" data-type="" data-week="${week}" data-idx="${idx}">Clear</button>
+    </div>
+    <h2>Recipes</h2>
+    <div class="card tight">
+      ${ranked.length ? ranked.map(({ r, uses }) => `
+        <div class="row"><div class="grow"><b>${esc(r.name)}</b>
+          <span class="sub">${uses.length ? `<span class="badge warn">Uses up ${esc(uses.map((f) => f.name).join(', '))}</span> ` : ''}${recipeMeta(r)}</span></div>
+          <button class="btn small primary" data-action="set-recipe" data-id="${r.id}" data-week="${week}" data-idx="${idx}">Pick</button></div>`).join('')
+      : '<p class="empty">Add recipes in the Recipes tab first.</p>'}
+    </div>
+    <button class="btn block" data-action="close">Cancel</button>`);
+}
+
+function moveDayDialog(week, idx) {
+  const wk = getWeek(week);
+  openDialog(`
+    <h3>Move “${dayTitle(wk.days[idx])}” to…</h3>
+    <p class="muted"><small>The two nights swap, so nothing you bought for gets dropped.</small></p>
+    <div class="card tight">
+      ${wk.days.map((d, i) => i === idx ? '' : `
+        <div class="row"><div class="grow"><b>${DAYS[fromIso(addDays(week, i)).getDay()]}</b><span class="sub">${dayTitle(d)}</span></div>
+          <button class="btn small" data-action="swap-day" data-week="${week}" data-idx="${idx}" data-to="${i}">Swap</button></div>`).join('')}
+    </div>
+    <button class="btn block" data-action="close">Cancel</button>`);
+}
+
+function cookDialog(week, idx) {
+  const d = getWeek(week).days[idx];
+  const r = recipeById(d.recipeId);
+  if (!r) return;
+  const used = usesFresh(r);
+  const radio = (name, value, label, checked) => `<label><input type="radio" name="${name}" value="${value}" ${checked ? 'checked' : ''}>${label}</label>`;
+  openDialog(`
+    <form data-form="dialog">
+      <h3>${esc(r.name)}</h3>
+      <label>Would you make it again?</label>
+      <div class="radio-row">${radio('rating', 'love', 'Yes, make again', r.rating === 'love')}${radio('rating', 'ok', 'It was fine', r.rating === 'ok' || !r.rating)}${radio('rating', 'no', 'Not again', r.rating === 'no')}</div>
+      <label>Was ${d.servings} servings the right amount?</label>
+      <div class="radio-row">${radio('amount', 'less', 'Too much', false)}${radio('amount', 'ok', 'Just right', true)}${radio('amount', 'more', 'Not enough', false)}</div>
+      <label>Portions of leftovers saved</label>
+      <input type="number" name="portions" min="0" max="20" value="0" inputmode="numeric">
+      ${used.length ? `<label>Fresh food this used up</label>
+        ${used.map((f) => `<div><label style="color:inherit;margin:4px 0"><input type="checkbox" name="used" value="${f.id}" checked> ${esc(f.name)}</label></div>`).join('')}` : ''}
+      <div class="actions"><button class="btn primary">Save</button><button type="button" class="btn" data-action="close">Cancel</button></div>
+    </form>`, (f) => {
+    r.rating = f.get('rating') || r.rating;
+    r.madeCount += 1;
+    r.lastMade = today();
+    const amount = f.get('amount');
+    let msg = 'Saved.';
+    if (amount === 'less' && d.servings > 1) { r.planServings = d.servings - 1; msg = `Next time this will be planned for ${r.planServings}.`; }
+    if (amount === 'more') { r.planServings = d.servings + 1; msg = `Next time this will be planned for ${r.planServings}.`; }
+    const portions = parseInt(f.get('portions'), 10) || 0;
+    if (portions > 0) state.leftovers.push({ id: uid(), name: r.name, made: today(), portions });
+    const usedIds = new Set(f.getAll('used'));
+    state.fresh = state.fresh.filter((x) => !usedIds.has(x.id));
+    d.cooked = true;
+    toast(msg);
+  });
+}
+
+function recipeDialog(id) {
+  const r = recipeById(id);
+  if (!r) return;
+  openDialog(`
+    <h3>${esc(r.name)}</h3>
+    <p>${recipeMeta(r)}</p>
+    <p class="muted"><small>Written for ${r.servings} servings · you plan it for ${plannedServings(r)}</small></p>
+    <h2>Ingredients</h2>
+    <div class="card tight">${r.ingredients.map((i) => `<div class="row"><div class="grow">${esc(ingredientLine(i))}</div><small class="muted">${i.cat}</small></div>`).join('') || '<p class="empty">None listed.</p>'}</div>
+    ${r.steps ? `<h2>Method</h2><p class="pre">${esc(r.steps)}</p>` : ''}
+    ${/^https?:\/\//i.test(r.source) ? `<p><a href="${esc(r.source)}" target="_blank" rel="noopener noreferrer">Original recipe</a></p>` : r.source ? `<p class="muted">${esc(r.source)}</p>` : ''}
+    <div class="actions">
+      <button class="btn" data-action="edit-recipe" data-id="${r.id}">Edit</button>
+      <button class="btn danger" data-action="delete-recipe" data-id="${r.id}">Delete</button>
+      <button class="btn primary" data-action="close">Close</button>
+    </div>`);
+}
+
+function recipeForm(id) {
+  const r = id ? recipeById(id) : null;
+  openDialog(`
+    <form data-form="dialog">
+      <h3>${r ? 'Edit recipe' : 'New recipe'}</h3>
+      <label>Name</label><input type="text" name="name" required value="${esc(r ? r.name : '')}">
+      <label>Servings the recipe makes</label><input type="number" name="servings" min="1" max="40" required value="${r ? r.servings : state.settings.servings}">
+      <label>Ingredients — one per line, amount first (e.g. “2 cups rice”)</label>
+      <textarea name="ingredients">${esc(r ? r.ingredients.map(ingredientLine).join('\n') : '')}</textarea>
+      <label>Method / notes</label><textarea name="steps">${esc(r ? r.steps : '')}</textarea>
+      <label>Source (link or cookbook page)</label><input type="text" name="source" value="${esc(r ? r.source : '')}">
+      <div class="actions"><button class="btn primary">Save</button><button type="button" class="btn" data-action="close">Cancel</button></div>
+    </form>`, (f) => {
+    const old = new Map((r ? r.ingredients : []).map((i) => [norm(i.name), i.cat]));
+    const data = {
+      name: f.get('name').trim(),
+      servings: Math.max(1, parseInt(f.get('servings'), 10) || 1),
+      ingredients: f.get('ingredients').split('\n').map((l) => l.trim()).filter(Boolean).map(parseIngredient)
+        .map((i) => ({ ...i, cat: old.get(norm(i.name)) || i.cat })),
+      steps: f.get('steps').trim(),
+      source: f.get('source').trim(),
+    };
+    if (r) Object.assign(r, data);
+    else state.recipes.push({ id: uid(), rating: null, madeCount: 0, lastMade: null, planServings: null, ...data });
+  });
+}
+
+function settingsDialog() {
+  openDialog(`
+    <form data-form="dialog">
+      <h3>Settings</h3>
+      <label>People you usually cook for</label>
+      <input type="number" name="servings" min="1" max="20" value="${state.settings.servings}">
+      <label>Week starts on</label>
+      <select name="weekStart">${DAYS.map((d, i) => `<option value="${i}" ${i === state.settings.weekStart ? 'selected' : ''}>${d}</option>`).join('')}</select>
+      <div class="actions"><button class="btn primary">Save</button><button type="button" class="btn" data-action="close">Cancel</button></div>
+      <h2>Your data</h2>
+      <p class="muted"><small>Everything is stored on this device only. Export a backup file to keep it safe or to move it to another phone.</small></p>
+      <div class="actions">
+        <button type="button" class="btn" data-action="export">Export backup</button>
+        <button type="button" class="btn" data-action="import">Import backup</button>
+        <button type="button" class="btn danger" data-action="reset">Erase everything</button>
+      </div>
+      <input type="file" id="import-file" accept="application/json,.json" hidden>
+    </form>`, (f) => {
+    state.settings.servings = Math.max(1, parseInt(f.get('servings'), 10) || 4);
+    state.settings.weekStart = parseInt(f.get('weekStart'), 10) || 0;
+    ui.week = weekStartOf(today());
+  });
+}
+
+// ---------- actions ----------
+function logWaste(name, kind) { state.wasteLog.push({ date: today(), name, kind }); }
+
+const actions = {
+  settings: () => settingsDialog(),
+  close: () => closeDialog(),
+  week: (el) => { ui.week = addDays(ui.week, Number(el.dataset.n)); render(); },
+
+  'pick-day': (el) => pickDayDialog(el.dataset.week, Number(el.dataset.idx)),
+  'move-day': (el) => moveDayDialog(el.dataset.week, Number(el.dataset.idx)),
+  'set-slot': (el) => {
+    getWeek(el.dataset.week).days[Number(el.dataset.idx)] = el.dataset.type ? { type: el.dataset.type } : null;
+    closeDialog(); commit();
+  },
+  'set-recipe': (el) => {
+    const r = recipeById(el.dataset.id);
+    getWeek(el.dataset.week).days[Number(el.dataset.idx)] = { type: 'recipe', recipeId: r.id, servings: plannedServings(r), cooked: false };
+    closeDialog(); commit();
+  },
+  'swap-day': (el) => {
+    const days = getWeek(el.dataset.week).days;
+    const a = Number(el.dataset.idx), b = Number(el.dataset.to);
+    [days[a], days[b]] = [days[b], days[a]];
+    closeDialog(); commit();
+  },
+  servings: (el) => {
+    const d = getWeek(el.dataset.week).days[Number(el.dataset.idx)];
+    openDialog(`
+      <form data-form="dialog"><h3>How many servings?</h3>
+        <input type="number" name="servings" min="1" max="40" value="${d.servings}" inputmode="numeric">
+        <p class="muted"><small>The shopping list scales to match. Cook extra on purpose only if you’ve planned a leftovers night.</small></p>
+        <div class="actions"><button class="btn primary">Save</button><button type="button" class="btn" data-action="close">Cancel</button></div>
+      </form>`, (f) => { d.servings = Math.max(1, parseInt(f.get('servings'), 10) || d.servings); });
+  },
+  cook: (el) => cookDialog(el.dataset.week, Number(el.dataset.idx)),
+
+  'build-list': () => {
+    buildList();
+    ui.tab = 'list';
+    commit();
+    const have = state.list.filter((i) => i.status === 'have').length;
+    toast(have ? `List built. ${have} item${have === 1 ? '' : 's'} you already have were left off.` : 'List built.');
+  },
+  'toggle-bought': (el) => { const i = state.list.find((x) => x.id === el.dataset.id); i.status = i.status === 'bought' ? 'need' : 'bought'; commit(); },
+  have: (el) => { const i = state.list.find((x) => x.id === el.dataset.id); i.status = 'have'; i.hint = ''; commit(); },
+  need: (el) => { state.list.find((x) => x.id === el.dataset.id).status = 'need'; commit(); },
+  'finish-shop': () => { const n = finishShopping(); commit(); toast(`${n} item${n === 1 ? '' : 's'} put away. Fresh food was added to Kitchen.`); },
+  'share-list': async () => {
+    const text = listAsText();
+    if (!text) return toast('Nothing to share yet.');
+    try {
+      if (navigator.share) await navigator.share({ title: 'Shopping list', text });
+      else { await navigator.clipboard.writeText(text); toast('List copied.'); }
+    } catch (e) { /* share sheet dismissed */ }
+  },
+
+  'recipe-filter': (el) => { ui.recipeFilter = el.dataset.id; render(); },
+  'new-recipe': () => recipeForm(null),
+  'view-recipe': (el) => recipeDialog(el.dataset.id),
+  'edit-recipe': (el) => recipeForm(el.dataset.id),
+  'delete-recipe': (el) => {
+    const r = recipeById(el.dataset.id);
+    if (!confirm(`Delete “${r.name}”?`)) return;
+    state.recipes = state.recipes.filter((x) => x.id !== r.id);
+    for (const wk of Object.values(state.weeks)) wk.days = wk.days.map((d) => (d && d.recipeId === r.id ? null : d));
+    closeDialog(); commit();
+  },
+
+  'left-done': (el) => { state.leftovers = state.leftovers.filter((x) => x.id !== el.dataset.id); commit(); },
+  'left-toss': (el) => { const l = state.leftovers.find((x) => x.id === el.dataset.id); logWaste(l.name, 'leftovers'); state.leftovers = state.leftovers.filter((x) => x !== l); commit(); },
+  'fresh-done': (el) => { state.fresh = state.fresh.filter((x) => x.id !== el.dataset.id); commit(); },
+  'fresh-toss': (el) => { const f = state.fresh.find((x) => x.id === el.dataset.id); logWaste(f.name, 'fresh'); state.fresh = state.fresh.filter((x) => x !== f); commit(); },
+  'staple-toggle': (el) => { const s = state.staples.find((x) => x.id === el.dataset.id); s.low = !s.low; commit(); },
+  'staple-del': (el) => { state.staples = state.staples.filter((x) => x.id !== el.dataset.id); commit(); },
+  'staple-edit': () => { ui.editStaples = !ui.editStaples; render(); },
+  'check-done': () => { const wk = getWeek(ui.week); wk.checkDone = true; ui.tab = 'plan'; commit(); },
+
+  export: () => {
+    const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `food-manager-${today()}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  },
+  import: () => $('#import-file').click(),
+  reset: () => {
+    if (!confirm('Erase all recipes, menus and lists on this device?')) return;
+    state = defaults();
+    ui.week = weekStartOf(today());
+    closeDialog(); commit();
+  },
+};
+
+const forms = {
+  'add-item': (f) => {
+    const p = parseIngredient(f.get('name'));
+    if (!p.name) return;
+    state.list.push({ id: uid(), source: 'manual', key: `manual|${uid()}`, status: 'need', for: [], ...p });
+  },
+  'add-left': (f) => state.leftovers.push({ id: uid(), name: f.get('name').trim(), made: today(), portions: 0 }),
+  'add-fresh': (f) => state.fresh.push({ id: uid(), name: f.get('name').trim(), added: today() }),
+  'add-staple': (f) => { const name = f.get('name').trim(); state.staples.push({ id: uid(), name, cat: guessCat(name), low: false }); },
+};
+
+// ---------- events ----------
+document.addEventListener('click', (e) => {
+  const tabBtn = e.target.closest('[data-tab]');
+  if (tabBtn) { ui.tab = tabBtn.dataset.tab; render(); window.scrollTo(0, 0); return; }
+  const el = e.target.closest('[data-action]');
+  if (el && actions[el.dataset.action]) actions[el.dataset.action](el);
+});
+
+document.addEventListener('submit', (e) => {
+  const form = e.target.closest('[data-form]');
+  if (!form) return;
+  e.preventDefault();
+  const data = new FormData(form);
+  if (form.dataset.form === 'dialog') {
+    if (onDialogSubmit) onDialogSubmit(data);
+    closeDialog();
+  } else {
+    forms[form.dataset.form](data);
+  }
+  commit();
+});
+
+document.addEventListener('input', (e) => {
+  if (e.target.id === 'recipe-q') { ui.q = e.target.value; $('#recipe-list').innerHTML = recipeListHtml(); }
+});
+
+document.addEventListener('change', (e) => {
+  if (e.target.id !== 'import-file' || !e.target.files[0]) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const data = JSON.parse(reader.result);
+      if (!data || !Array.isArray(data.recipes) || !data.settings) throw new Error('bad file');
+      state = Object.assign(defaults(), data);
+      ui.week = weekStartOf(today());
+      closeDialog(); commit(); toast('Backup imported.');
+    } catch (err) { toast('That file is not a Food Manager backup.'); }
+  };
+  reader.readAsText(e.target.files[0]);
+});
+
+// ---------- start ----------
+load();
+ui.week = weekStartOf(today());
+render();
