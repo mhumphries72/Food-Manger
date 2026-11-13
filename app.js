@@ -152,7 +152,13 @@ function migrate() {
   for (const x of state.fresh) if (!x.kind) x.kind = 'fresh';
 }
 const locs = () => state.settings.locations;
-function save() { localStorage.setItem(KEY, JSON.stringify(state)); }
+function save() {
+  localStorage.setItem(KEY, JSON.stringify(state));
+  if (!sync) return;
+  for (const k of SECTIONS) if (JSON.stringify(state[k]) !== pushed[k] && !sync.dirty.includes(k)) sync.dirty.push(k);
+  saveSync();
+  flush();
+}
 
 const ui = { tab: 'home', week: null, recipeFilter: 'all', q: '', editStaples: false };
 
@@ -648,8 +654,18 @@ function settingsDialog() {
       <label>Places food is kept — one per line, in the order you check them</label>
       <textarea name="locations" style="min-height:90px">${esc(locs().join('\n'))}</textarea>
       <div class="actions"><button class="btn primary">Save</button><button type="button" class="btn" data-action="close">Cancel</button></div>
+      <h2>Family sharing</h2>
+      ${sync ? `
+        <p class="muted"><small>This phone is sharing with your household. Send the invite link to each family member; opening it on their phone joins them.</small></p>
+        <div class="actions">
+          <button type="button" class="btn primary" data-action="sync-invite">Invite link</button>
+          <button type="button" class="btn danger" data-action="sync-leave">Stop sharing on this phone</button>
+        </div>` : `
+        <p class="muted"><small>To share one set of data across phones, paste your Firebase database address (see the README) and start sharing from this phone. Everyone else joins with an invite link.</small></p>
+        <input type="text" id="sync-url" placeholder="https://your-project-default-rtdb.firebaseio.com" autocomplete="off" autocapitalize="off">
+        <div class="actions"><button type="button" class="btn primary" data-action="sync-create">Start sharing from this phone</button></div>`}
       <h2>Your data</h2>
-      <p class="muted"><small>Everything is stored on this device only. Export a backup file to keep it safe or to move it to another phone.</small></p>
+      <p class="muted"><small>Export a backup file now and then to keep your recipes safe.</small></p>
       <div class="actions">
         <button type="button" class="btn" data-action="export">Export backup</button>
         <button type="button" class="btn" data-action="import">Import backup</button>
@@ -763,8 +779,35 @@ const actions = {
     URL.revokeObjectURL(a.href);
   },
   import: () => $('#import-file').click(),
+  'sync-create': () => {
+    const url = $('#sync-url').value.trim();
+    if (!/^https?:\/\/\S+$/.test(url)) return toast('Paste the database address first. It starts with https://');
+    const bytes = crypto.getRandomValues(new Uint8Array(24));
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+    connectSync(url, Array.from(bytes, (b) => alphabet[b % alphabet.length]).join(''));
+    closeDialog();
+    toast('Sharing started. Open Settings to get the invite link.');
+  },
+  'sync-invite': async () => {
+    const link = inviteLink();
+    openDialog(`
+      <h3>Invite link</h3>
+      <p class="muted"><small>Send this to family members only. Anyone who has it can see and change your household’s food data.</small></p>
+      <input type="text" readonly value="${esc(link)}" onfocus="this.select()">
+      <div class="actions"><button class="btn primary" id="invite-send">Share / copy</button><button class="btn" data-action="close">Close</button></div>`);
+    $('#invite-send').onclick = async () => {
+      try {
+        if (navigator.share) await navigator.share({ title: 'Join our Food Manager', url: link });
+        else { await navigator.clipboard.writeText(link); toast('Link copied.'); }
+      } catch (e) { /* dismissed */ }
+    };
+  },
+  'sync-leave': () => {
+    if (!confirm('Stop sharing on this phone? The data stays here, but it will no longer update.')) return;
+    sync = null; saveSync(); startSync(); closeDialog();
+  },
   reset: () => {
-    if (!confirm('Erase all recipes, menus and lists on this device?')) return;
+    if (!confirm(sync ? 'Erase all recipes, menus and lists for EVERYONE in your household?' : 'Erase all recipes, menus and lists on this device?')) return;
     state = defaults();
     ui.week = weekStartOf(today());
     closeDialog(); commit();
@@ -828,7 +871,166 @@ document.addEventListener('change', (e) => {
   reader.readAsText(e.target.files[0]);
 });
 
+// ---------- family sharing (Firebase Realtime Database over its REST API) ----------
+// Each top-level section of the state is stored as one string, "<clientId>\n<json>", under
+// /households/<code>. Strings round-trip exactly, and syncing per section means two people
+// editing different things (say, the list and a recipe) never overwrite each other.
+const SYNC_KEY = 'foodmanager.sync';
+const SECTIONS = ['settings', 'recipes', 'weeks', 'list', 'fresh', 'leftovers', 'staples', 'wasteLog'];
+let sync = null;            // { url, code, client, dirty: [sections changed here but not yet uploaded] }
+const pushed = {};          // section -> JSON last known to match the server
+let stream = null, syncReady = false, flushing = false;
+const pendingRemote = [];
+
+function loadSync() {
+  try { sync = JSON.parse(localStorage.getItem(SYNC_KEY)); } catch (e) { sync = null; }
+  for (const k of SECTIONS) pushed[k] = JSON.stringify(state[k]);
+}
+function saveSync() {
+  if (sync) localStorage.setItem(SYNC_KEY, JSON.stringify(sync));
+  else localStorage.removeItem(SYNC_KEY);
+}
+const syncEndpoint = () => `${sync.url}/households/${sync.code}.json`;
+
+function setSyncState(s) {
+  const el = $('#sync-status');
+  el.textContent = { off: '', connecting: 'Connecting…', ok: 'Shared', offline: 'Offline' }[s];
+  el.className = `sync ${s}`;
+  el.dataset.state = s;
+}
+
+function startSync() {
+  if (stream) { stream.close(); stream = null; }
+  syncReady = false;
+  if (!sync) return setSyncState('off');
+  setSyncState('connecting');
+  stream = new EventSource(syncEndpoint());
+  const on = (e) => {
+    const msg = { type: e.type, ...JSON.parse(e.data) };
+    if (dialog().open) pendingRemote.push(msg); else applyRemote(msg);
+  };
+  stream.addEventListener('put', on);
+  stream.addEventListener('patch', on);
+  stream.addEventListener('cancel', () => { setSyncState('offline'); toast('The database refused access. Check its rules.'); });
+  stream.onerror = () => setSyncState('offline');   // EventSource reconnects by itself
+}
+
+function applyRemote({ type, path, data }) {
+  if (!sync) return;
+  const whole = path === '/';
+  const incoming = whole ? (data || {}) : { [path.split('/')[1]]: data };
+  let changed = false;
+  for (const k of SECTIONS) {
+    const v = incoming[k];
+    if (typeof v !== 'string') {
+      // A full snapshot without this section: the household doesn't have it yet, so upload ours.
+      if (whole && type === 'put' && !sync.dirty.includes(k)) sync.dirty.push(k);
+      continue;
+    }
+    const nl = v.indexOf('\n');
+    const by = v.slice(0, nl), json = v.slice(nl + 1);
+    if (by === sync.client) continue;   // our own echo
+    if (sync.dirty.includes(k)) {
+      // Both sides changed this section (usually after being offline): combine them, then upload.
+      try { state[k] = merge3(pushed[k], state[k], JSON.parse(json)); changed = true; } catch (e) { /* keep ours */ }
+      pushed[k] = json;
+      continue;
+    }
+    pushed[k] = json;
+    if (json !== JSON.stringify(state[k])) {
+      try { state[k] = JSON.parse(json); changed = true; } catch (e) { /* ignore a corrupt section */ }
+    }
+  }
+  syncReady = true;
+  setSyncState('ok');
+  if (changed) {
+    migrate();
+    localStorage.setItem(KEY, JSON.stringify(state));
+    ui.week = weekStartOf(ui.week);
+    render();
+  }
+  saveSync();
+  flush();
+}
+
+// Three-way merge of one section, item by item: whichever side changed an item since the last
+// sync wins, and a change made on this phone wins if both did.
+function merge3(baseJson, local, remote) {
+  const isArr = Array.isArray(remote);
+  const keyOf = (x) => (x && x.id) || JSON.stringify(x);
+  const toMap = (v) => new Map(isArr ? (v || []).map((x) => [keyOf(x), x]) : Object.entries(v || {}));
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const B = toMap(JSON.parse(baseJson)), L = toMap(local), R = toMap(remote);
+  const out = new Map();
+  for (const [k, v] of R) {
+    if (same(L.get(k), B.get(k))) out.set(k, v);          // untouched here: take theirs
+    else if (L.has(k)) out.set(k, L.get(k));              // edited here (deleted here: drop)
+  }
+  for (const [k, v] of L) {
+    if (!R.has(k) && !same(v, B.get(k))) out.set(k, v);   // added or edited here
+  }
+  return isArr ? [...out.values()] : Object.fromEntries(out);
+}
+
+async function flush() {
+  if (!sync || !syncReady || flushing || !sync.dirty.length) return;
+  flushing = true;
+  const target = sync, keys = [...sync.dirty], body = {}, sent = {};
+  for (const k of keys) { sent[k] = JSON.stringify(state[k]); body[k] = `${sync.client}\n${sent[k]}`; }
+  let ok = false;
+  try {
+    const res = await fetch(syncEndpoint(), { method: 'PATCH', body: JSON.stringify(body) });
+    ok = res.ok;
+  } catch (e) { /* offline */ }
+  flushing = false;
+  if (sync !== target) return;
+  if (!ok) return setSyncState('offline');
+  for (const k of keys) {
+    pushed[k] = sent[k];
+    if (JSON.stringify(state[k]) === sent[k]) sync.dirty = sync.dirty.filter((x) => x !== k);
+  }
+  saveSync();
+  setSyncState('ok');
+  if (sync.dirty.length) flush();
+}
+
+function connectSync(url, code) {
+  sync = { url: url.replace(/\/+$/, ''), code, client: uid(), dirty: [] };
+  for (const k of SECTIONS) pushed[k] = JSON.stringify(state[k]);
+  saveSync();
+  startSync();
+}
+
+function inviteLink() {
+  const token = btoa(JSON.stringify({ u: sync.url, c: sync.code }));
+  return `${location.origin}${location.pathname}#join=${encodeURIComponent(token)}`;
+}
+
+function checkInvite() {
+  const m = location.hash.match(/^#join=(.+)$/);
+  if (!m) return;
+  history.replaceState(null, '', location.pathname + location.search);
+  let inv;
+  try { inv = JSON.parse(atob(decodeURIComponent(m[1]))); } catch (e) { return toast('That invite link is not valid.'); }
+  if (!inv || !/^https?:\/\//.test(inv.u) || !/^[A-Za-z0-9]{20,}$/.test(inv.c)) return toast('That invite link is not valid.');
+  if (sync && sync.url === inv.u && sync.code === inv.c) return;
+  openDialog(`
+    <h3>Join your household?</h3>
+    <p>This phone will share one set of recipes, menus and lists with everyone else who joined.</p>
+    <p class="muted"><small>Anything saved in the app on this phone so far will be replaced by the household’s data.</small></p>
+    <div class="actions"><button class="btn primary" id="join-yes">Join</button><button class="btn" data-action="close">Not now</button></div>`);
+  $('#join-yes').onclick = () => { closeDialog(); connectSync(inv.u, inv.c); toast('Joined. Loading the household’s data…'); };
+}
+
+window.addEventListener('online', flush);
+window.addEventListener('hashchange', checkInvite);
+setInterval(flush, 20000);
+
 // ---------- start ----------
 load();
+loadSync();
 ui.week = weekStartOf(today());
 render();
+dialog().addEventListener('close', () => { while (pendingRemote.length) applyRemote(pendingRemote.shift()); });
+startSync();
+checkInvite();

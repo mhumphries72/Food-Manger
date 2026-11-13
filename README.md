@@ -4,8 +4,8 @@ A small, phone-friendly web app for running a household's food: a weekly menu, a
 list built from it, the recipes worth making again, and a light-touch way to see what needs
 eating before it goes bad.
 
-It is plain HTML, CSS and JavaScript with no build step and no server. Data is stored in the
-browser on the device you use it on.
+It is plain HTML, CSS and JavaScript with no build step. Each phone keeps its own copy of the
+data, and optional family sharing keeps every phone in step through a free Firebase database.
 
 ## The weekly routine
 
@@ -34,20 +34,63 @@ During the week:
   leftovers you saved.
 - Tap **Tossed** when something is thrown out. The monthly count on Home is your scoreboard.
 
-## Running it
+## Setting it up
 
-Open `index.html` through any static web server, for example:
+### 1. Publish the app with GitHub Pages
+
+1. Merge this code into the `main` branch.
+2. On a free GitHub plan the repository must be public: **Settings → General → Danger Zone →
+   Change visibility → Public**. Only the app's code is in the repository, never your data.
+3. **Settings → Pages → Build and deployment**: set *Source* to "Deploy from a branch", choose
+   `main` and `/ (root)`, and save.
+4. After a minute the app is live at `https://<your-username>.github.io/<repository-name>/`.
+   Open it on each phone and use "Add to Home Screen".
+
+### 2. Turn on family sharing
+
+1. Go to <https://console.firebase.google.com>, sign in with a Google account and create a
+   project (Google Analytics is not needed).
+2. In the project choose **Build → Realtime Database → Create database** and start in
+   *locked mode*.
+3. On the database's **Rules** tab, replace the rules with these and publish:
+
+   ```json
+   {
+     "rules": {
+       "households": {
+         "$code": {
+           ".read": "$code.length >= 20",
+           ".write": "$code.length >= 20"
+         }
+       }
+     }
+   }
+   ```
+
+4. Copy the database address from the **Data** tab. It looks like
+   `https://your-project-default-rtdb.firebaseio.com`.
+5. In the app on one phone open **Settings**, paste the address under *Family sharing* and tap
+   **Start sharing from this phone**. That phone's data becomes the household's data.
+6. Open **Settings → Invite link**, send the link to each family member, and have them open
+   it on their phone and tap **Join**.
+
+The header shows **Shared** when a phone is in step and **Offline** when it is not. Changes made
+offline are kept on the phone and combined with everyone else's when it reconnects.
+
+The invite link is the key to your data: the household code inside it is long and random, and
+anyone who has the link can read and change the household's food data. Share it only with
+family.
+
+### Running it locally
 
 ```bash
 python3 -m http.server 8000
 ```
 
-Then visit <http://localhost:8000>. To use it on your phones, host the folder anywhere that
-serves static files (GitHub Pages works: Settings → Pages → deploy from the `main` branch),
-open the address, and use "Add to Home Screen".
+Then visit <http://localhost:8000>.
 
 ## Data and backups
 
-Everything is saved in the browser's local storage on that one device; it does not sync
-between phones. Use **Settings → Export backup** to save a file, and **Import backup** to load
-it on another device. The shopping list can be sent to someone with **Share / copy**.
+Use **Settings → Export backup** now and then to save a copy of everything to a file, and
+**Import backup** to restore it. The shopping list can also be sent as text with
+**Share / copy**.
