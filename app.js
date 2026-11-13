@@ -111,7 +111,7 @@ function defaults() {
     rating: null, madeCount: 0, lastMade: null, planServings: null,
   });
   return {
-    settings: { servings: 4, weekStart: 0, locations: ['Main fridge', 'Garage fridge', 'Storage room'] },
+    settings: { servings: 4, weekStart: 0, locations: ['Main fridge', 'Kitchen pantry', 'Garage fridge', 'Storage room'] },
     recipes: [
       recipe('Sheet-Pan Chicken & Vegetables', 4,
         ['1.5 lb chicken thighs', '1 lb potatoes', '2 carrots', '1 head broccoli', '2 tbsp olive oil', '1 tsp paprika', 'salt'],

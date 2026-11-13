@@ -13,7 +13,7 @@ Pick one planning time each week (for example, Saturday morning) and work down t
 on the Home screen. It takes about 15 minutes.
 
 1. **Kitchen check** — walk to every place food is kept (by default the main fridge, the
-   garage fridge and the storage room; edit the list in Settings). In each one, add what needs
+   kitchen pantry, the garage fridge and the storage room; edit the list in Settings). In each one, add what needs
    using up, note spares stored there, and tick the place off. The Menu and Home screens keep
    reminding you until every place is checked.
 
