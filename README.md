@@ -44,8 +44,11 @@ During the week:
 
 ## Adding things quickly
 
-- **Paste a recipe**: in Recipes tap *New*, then *Paste a recipe instead of typing*. Paste the
-  whole recipe text copied from a website, message or note; the app picks out the name,
+- **Import from a link**: in Recipes tap *New*, then *Add from a link or pasted text*, and
+  paste the address of a recipe page. This needs the one-time setup in "Turn on recipe link
+  import" below.
+- **Paste a recipe**: in the same box, paste the
+  whole recipe text copied from a website, message or note instead; the app picks out the name,
   servings, ingredients, method and link for you to check before saving.
 - **Add several items at once**: in the shopping list or a Kitchen place, type or dictate items
   with commas between them ("milk, eggs, 2 lb chicken"), or paste a list with one item per line.
@@ -98,6 +101,28 @@ offline are kept on the phone and combined with everyone else's when it reconnec
 The invite link is the key to your data: the household code inside it is long and random, and
 anyone who has the link can read and change the household's food data. Share it only with
 family.
+
+### 3. Turn on recipe link import (optional)
+
+A web page cannot read other websites directly, so link import uses a small free helper
+service (a Cloudflare Worker) that you own. Its code is in `worker/recipe-import.js`.
+
+1. Create a free account at <https://dash.cloudflare.com> and open **Workers & Pages**.
+2. Create a new Worker (the "Hello World" starter is fine), name it `recipe-import`, and
+   deploy it.
+3. Choose **Edit code**, delete everything in the editor, paste in the whole contents of
+   `worker/recipe-import.js`, and deploy again.
+4. Copy the Worker's address. It looks like `https://recipe-import.your-name.workers.dev`.
+5. In the app open **Settings**, paste the address into *Recipe link import address* and
+   save. With family sharing on, every phone picks it up.
+
+The Worker only answers requests coming from the app's own address, which is set in
+`ALLOWED_ORIGINS` at the top of the file (`https://mhumphries72.github.io`). Change that line
+if the app is ever hosted somewhere else.
+
+Link import reads the recipe details most recipe sites publish for search engines. On a page
+without them, or a site that blocks automated visits, the app says so; copy the recipe text
+and paste it instead.
 
 ### Running it locally
 
