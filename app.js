@@ -662,16 +662,54 @@ function recipeDialog(id) {
 
 function pasteRecipeDialog() {
   openDialog(`
-    <h3>Paste a recipe</h3>
-    <p class="muted"><small>Copy the recipe from a website, message or note and paste all of it here. You can check and fix it before saving.</small></p>
-    <textarea id="paste-text" style="min-height:220px" placeholder="Paste the recipe text…"></textarea>
+    <h3>Add from a link or pasted text</h3>
+    <p class="muted"><small>Paste the address of a recipe page, or copy the whole recipe from a website, message or note and paste it here. You can check and fix it before saving.</small></p>
+    <textarea id="paste-text" style="min-height:200px" placeholder="Paste a link or the recipe text…"></textarea>
     <div class="actions"><button class="btn primary" id="paste-go">Read recipe</button><button class="btn" data-action="close">Cancel</button></div>`);
-  $('#paste-go').onclick = () => {
-    const text = $('#paste-text').value;
-    if (!text.trim()) return toast('Paste the recipe text first.');
-    const draft = parseRecipeText(text);
+  $('#paste-go').onclick = async () => {
+    const text = $('#paste-text').value.trim();
+    if (!text) return toast('Paste a link or the recipe text first.');
+    let draft;
+    if (/^https?:\/\/\S+$/i.test(text)) {
+      if (!state.settings.importUrl) return toast('Link import is not set up yet. Paste the recipe text instead, or add the import address in Settings.');
+      const btn = $('#paste-go');
+      btn.disabled = true; btn.textContent = 'Reading…';
+      draft = await importFromLink(text);
+      if (!$('#paste-go')) return;                 // dialog was closed while waiting
+      btn.disabled = false; btn.textContent = 'Read recipe';
+      if (!draft) return;
+    } else {
+      draft = parseRecipeText(text);
+    }
     recipeForm(null, draft);
     toast(draft.ingredients.length ? `Found ${draft.ingredients.length} ingredients. Check them over, then save.` : 'No ingredients found. Add them by hand.');
+  };
+}
+
+// Ask the recipe-import Worker (see worker/recipe-import.js) to read a recipe page.
+async function importFromLink(link) {
+  let res, data;
+  try {
+    res = await fetch(`${state.settings.importUrl}?url=${encodeURIComponent(link)}`);
+    data = await res.json();
+  } catch (e) {
+    toast('Could not reach the import service. Check your connection and the address in Settings.');
+    return null;
+  }
+  if (!res.ok) {
+    toast(data && data.error === 'no-recipe' ? 'No recipe was found on that page. Copy the recipe text and paste it instead.'
+      : data && data.error === 'origin' ? 'The import service does not allow this site. Check ALLOWED_ORIGINS in the Worker.'
+      : 'That page could not be read. Copy the recipe text and paste it instead.');
+    return null;
+  }
+  const steps = Array.isArray(data.steps) ? data.steps.map(String) : [];
+  let count = 0;
+  return {
+    name: String(data.name || '').slice(0, 80),
+    servings: data.servings >= 1 ? Math.round(data.servings) : state.settings.servings,
+    ingredients: (Array.isArray(data.ingredients) ? data.ingredients : []).map((l) => String(l).trim()).filter(Boolean).map(parseIngredient),
+    steps: steps.length > 1 ? steps.map((t) => (/:$/.test(t) ? t : `${++count}. ${t}`)).join('\n') : steps.join(''),
+    source: String(data.source || link),
   };
 }
 
@@ -681,7 +719,7 @@ function recipeForm(id, draft) {
   openDialog(`
     <form data-form="dialog">
       <h3>${r ? 'Edit recipe' : draft ? 'Check the recipe' : 'New recipe'}</h3>
-      ${v ? '' : '<button type="button" class="btn block" data-action="paste-recipe" style="margin:0 0 6px">Paste a recipe instead of typing</button>'}
+      ${v ? '' : '<button type="button" class="btn block" data-action="paste-recipe" style="margin:0 0 6px">Add from a link or pasted text</button>'}
       <label>Name</label><input type="text" name="name" required value="${esc(v ? v.name : '')}">
       <label>Servings the recipe makes</label><input type="number" name="servings" min="1" max="40" required value="${v ? v.servings : state.settings.servings}">
       <label>Ingredients — one per line, amount first (e.g. “2 cups rice”)</label>
@@ -712,6 +750,8 @@ function settingsDialog() {
       <input type="number" name="servings" min="1" max="20" value="${state.settings.servings}">
       <label>Week starts on</label>
       <select name="weekStart">${DAYS.map((d, i) => `<option value="${i}" ${i === state.settings.weekStart ? 'selected' : ''}>${d}</option>`).join('')}</select>
+      <label>Recipe link import address (optional — see the README)</label>
+      <input type="text" name="importUrl" value="${esc(state.settings.importUrl || '')}" placeholder="https://recipe-import.your-name.workers.dev" autocomplete="off" autocapitalize="off">
       <label>Places food is kept — one per line, in the order you check them</label>
       <textarea name="locations" style="min-height:90px">${esc(locs().join('\n'))}</textarea>
       <div class="actions"><button class="btn primary">Save</button><button type="button" class="btn" data-action="close">Cancel</button></div>
@@ -736,6 +776,7 @@ function settingsDialog() {
     </form>`, (f) => {
     state.settings.servings = Math.max(1, parseInt(f.get('servings'), 10) || 4);
     state.settings.weekStart = parseInt(f.get('weekStart'), 10) || 0;
+    state.settings.importUrl = f.get('importUrl').trim().replace(/[/?]+$/, '');
     const places = [...new Set(f.get('locations').split('\n').map((l) => l.trim()).filter(Boolean))];
     if (places.length) state.settings.locations = places;
     migrate();
