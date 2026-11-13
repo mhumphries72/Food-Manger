@@ -211,3 +211,5 @@ select.kind { flex: none; width: auto; }
 .sync { font-size: .75rem; padding: 2px 9px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); }
 .sync.off { display: none; }
 .sync.offline, .sync.connecting { background: var(--warn-soft); color: var(--warn); }
+
+.count { min-width: 1.6em; text-align: center; }

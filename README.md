@@ -15,12 +15,20 @@ on the Home screen. It takes about 15 minutes.
 1. **Kitchen check** — walk to every place food is kept (by default the main fridge, the
    garage fridge and the storage room; edit the list in Settings). In each one, add what needs
    using up, note spares stored there, and tick the place off. The Menu and Home screens keep
-   reminding you until every place is checked. Then tap the staples you are low on.
+   reminding you until every place is checked.
+
+   Staples are listed under the place they are kept, each with a **safety stock** number
+   ("keep 1", "keep 6"). During the check, set the count of what is actually there with the
+   − and + buttons. When the count is below the safety stock, the shopping list adds enough
+   to get back to it. Tap a staple's name to change its safety stock or where it is kept.
+   Example: add "Milk spare gallon" as a staple in the garage fridge with keep 1; when the
+   spare is gone, the count is 0 and a gallon goes on the list.
 2. **Plan the menu** — pick a meal for each night. Recipes that use up what is already in the
    fridge are listed first. Leave a *leftovers night* and a *flex night* so a changed plan
    does not turn into wasted food.
 3. **Build the shopping list** — ingredients are scaled to the servings you planned, merged,
-   and grouped by store section. Stocked staples and food already in any location are left off,
+   and grouped by store section. Staples below their safety stock are added. Stocked staples
+   and food already in any location are left off,
    with a note saying where the spare is (for example, "spare in the Garage fridge").
 4. **Shop** — check items off in the store and tap *Finish shopping*. Fresh food you bought is
    added to the Kitchen "use up" list automatically.

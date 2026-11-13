@@ -105,7 +105,7 @@ function sameFood(a, b) {
 
 // ---------- state ----------
 function defaults() {
-  const staple = (name) => ({ id: uid(), name, cat: guessCat(name), low: false });
+  const staple = (name) => ({ id: uid(), name, cat: guessCat(name), target: 1, have: 1 });
   const recipe = (name, servings, lines, steps) => ({
     id: uid(), name, servings, ingredients: lines.map(parseIngredient), steps, source: '',
     rating: null, madeCount: 0, lastMade: null, planServings: null,
@@ -150,6 +150,14 @@ function migrate() {
   const known = new Set(locs());
   for (const x of [...state.fresh, ...state.leftovers]) if (!known.has(x.loc)) x.loc = locs()[0];
   for (const x of state.fresh) if (!x.kind) x.kind = 'fresh';
+  // Staples carry a safety-stock level ("keep") and a count ("have"), and live in one place.
+  const store = locs().find((l) => /storage|pantry|basement|cupboard/i.test(l)) || locs()[0];
+  for (const x of state.staples) {
+    if (!(x.target >= 1)) x.target = 1;
+    if (!(x.have >= 0)) x.have = x.low ? 0 : x.target;
+    delete x.low;
+    if (!known.has(x.loc)) x.loc = PERISHABLE.has(x.cat) ? locs()[0] : store;
+  }
 }
 const locs = () => state.settings.locations;
 function save() {
@@ -202,7 +210,8 @@ function buildList() {
     }
   }
   const previous = new Map(state.list.filter((i) => i.source === 'plan').map((i) => [i.key, i]));
-  const list = state.list.filter((i) => i.source !== 'plan');
+  const short = (id) => state.staples.some((x) => x.id === id && x.have < x.target);
+  const list = state.list.filter((i) => i.source !== 'plan' && !(i.source === 'staple' && i.status === 'need' && !short(i.stapleId)));
 
   for (const e of merged.values()) {
     const old = previous.get(e.key);
@@ -213,17 +222,18 @@ function buildList() {
       const staple = state.staples.find((s) => sameFood(s.name, e.name));
       const fresh = onHand(e.name);
       if (fresh) { status = 'have'; hint = `in the ${fresh.loc}`; }
-      else if (staple && !staple.low) { status = 'have'; hint = 'staple in stock'; }
+      else if (staple && staple.have > 0) { status = 'have'; hint = `${staple.have} in the ${staple.loc}`; }
     }
     list.push({ id: old ? old.id : uid(), source: 'plan', status, hint: old ? old.hint : hint, ...e });
   }
-  for (const s of state.staples.filter((x) => x.low)) {
+  // Staples below their safety stock: buy enough to get back up to the "keep" level.
+  for (const s of state.staples.filter((x) => x.have < x.target)) {
     const key = `staple|${s.id}`;
-    if (list.some((i) => i.key === key || (i.status !== 'have' && sameFood(i.name, s.name)))) continue;
-    // A spare in another fridge or the storage room beats buying a duplicate.
-    const spare = onHand(s.name);
-    list.push({ id: uid(), source: 'staple', stapleId: s.id, key, name: s.name, unit: '', qty: null, cat: s.cat,
-      status: spare ? 'have' : 'need', hint: spare ? `spare in the ${spare.loc}` : '', for: [] });
+    const qty = s.target - s.have;
+    const mine = list.find((i) => i.key === key);
+    if (mine) { mine.qty = qty; continue; }
+    if (list.some((i) => i.status !== 'have' && sameFood(i.name, s.name))) continue;
+    list.push({ id: uid(), source: 'staple', stapleId: s.id, key, name: s.name, unit: '', qty, cat: s.cat, status: 'need', hint: '', for: [] });
   }
   state.list = list;
   wk.listBuilt = true;
@@ -235,8 +245,8 @@ function finishShopping() {
     if (PERISHABLE.has(i.cat) && !perishables().some((f) => norm(f.name) === norm(i.name))) {
       state.fresh.push({ id: uid(), name: i.name, added: today(), loc: locs()[0], kind: 'fresh' });
     }
-    const s = state.staples.find((x) => x.id === i.stapleId || sameFood(x.name, i.name));
-    if (s) s.low = false;
+    const s = state.staples.find((x) => x.id === i.stapleId) || state.staples.find((x) => sameFood(x.name, i.name));
+    if (s) s.have = i.source === 'staple' ? s.have + (i.qty || 1) : Math.max(s.have, 1);
   }
   state.list = state.list.filter((i) => i.status === 'need');
   getWeek(ui.week).shopped = true;
@@ -378,7 +388,7 @@ function viewList() {
     <div class="row ${i.status === 'bought' ? 'done' : ''}">
       <button class="check ${i.status === 'bought' ? 'on' : ''}" data-action="toggle-bought" data-id="${i.id}" aria-label="Bought">${i.status === 'bought' ? '&#10003;' : ''}</button>
       <div class="grow"><b>${esc(i.name)}</b> ${esc([fmtQty(i.qty), i.unit].filter(Boolean).join(' '))}
-        ${i.for && i.for.length ? `<span class="sub">${esc(i.for.join(', '))}</span>` : i.source === 'staple' ? '<span class="sub">Staple running low</span>' : ''}</div>
+        ${i.for && i.for.length ? `<span class="sub">${esc(i.for.join(', '))}</span>` : i.source === 'staple' ? '<span class="sub">Staple below safety stock</span>' : ''}</div>
       ${i.status === 'need' ? `<button class="btn small" data-action="have" data-id="${i.id}">Have it</button>` : ''}
     </div>`;
 
@@ -455,13 +465,14 @@ function viewKitchen() {
   const wk = getWeek(ui.week);
   const missing = locs().filter((l) => !wk.checked[l]);
   return `
-    <div class="note">Once a week, before planning, walk to <b>every</b> place below. Add what needs using up, note what is stored there, then tick the place off. Tap an item’s name to move it.</div>
+    <div class="note">Once a week, before planning, walk to <b>every</b> place below. Add what needs using up, count the staples kept there, then tick the place off. Tap a name to move or edit it.</div>
 
     ${locs().map((loc) => {
       const ok = wk.checked[loc];
       const left = state.leftovers.filter((x) => x.loc === loc).sort((a, b) => a.made.localeCompare(b.made));
       const items = state.fresh.filter((x) => x.loc === loc)
         .sort((a, b) => ((a.kind === 'stock') - (b.kind === 'stock')) || a.added.localeCompare(b.added));
+      const staples = state.staples.filter((x) => x.loc === loc);
       const cold = /fridge|freezer/i.test(loc);
       const opt = (v, label, sel) => `<option value="${v}" ${sel ? 'selected' : ''}>${label}</option>`;
       return `
@@ -470,26 +481,23 @@ function viewKitchen() {
         ${left.length || items.length ? left.map((x) => itemRow(x, 'left')).join('') + items.map((x) => itemRow(x, 'fresh')).join('')
         : '<p class="empty">Nothing listed here.</p>'}
       </div>
+      ${staples.length ? `<div class="card tight">
+        <div class="row"><small class="muted">Staples kept here — count what is unopened or spare</small></div>
+        ${staples.map((x) => `
+        <div class="row"><button class="grow namebtn" data-action="staple-open" data-id="${x.id}"><b>${esc(x.name)}</b>
+            <span class="sub">Keep ${x.target}${x.have < x.target ? ` · <span class="badge warn">buy ${x.target - x.have}</span>` : ''}</span></button>
+          <button class="btn small" data-action="staple-count" data-id="${x.id}" data-n="-1" aria-label="One fewer">&minus;</button>
+          <b class="count">${x.have}</b>
+          <button class="btn small" data-action="staple-count" data-id="${x.id}" data-n="1" aria-label="One more">+</button></div>`).join('')}
+      </div>` : ''}
       <form class="inline" data-form="add-loc-item">
         <input type="hidden" name="loc" value="${esc(loc)}">
         <input type="text" name="name" placeholder="Add an item…" autocomplete="off" required>
-        <select name="kind" class="kind" aria-label="Kind">${opt('fresh', 'Fresh', cold)}${opt('left', 'Leftovers', false)}${opt('stock', 'Stored', !cold)}</select>
+        <select name="kind" class="kind" aria-label="Kind">${opt('fresh', 'Fresh', cold)}${opt('left', 'Leftovers', false)}${opt('stock', 'Stored', !cold)}${opt('staple', 'Staple', false)}</select>
         <button class="btn">Add</button>
       </form>
       <button class="btn block ${ok ? '' : 'primary'}" data-action="loc-check" data-loc="${esc(loc)}">${ok ? `&#10003; ${esc(loc)} checked — undo` : `I’ve looked through the ${esc(loc)}`}</button>`;
     }).join('')}
-
-    <h2>Staples <small>tap the ones running low</small></h2>
-    <div class="card">
-      <p class="muted"><small>Only mark a staple low after checking every place. If a spare is listed above, the shopping list will point you to it instead of buying another.</small></p>
-      <div class="chips">
-        ${state.staples.map((s) => ui.editStaples
-          ? `<button class="chip" data-action="staple-del" data-id="${s.id}">${esc(s.name)} &times;</button>`
-          : `<button class="chip ${s.low ? 'low' : ''}" data-action="staple-toggle" data-id="${s.id}">${esc(s.name)}</button>`).join('')}
-      </div>
-      <form class="inline" data-form="add-staple" style="margin-top:10px"><input type="text" name="name" placeholder="Add a staple…" autocomplete="off" required><button class="btn">Add</button></form>
-      <div class="actions"><button class="btn small" data-action="staple-edit">${ui.editStaples ? 'Done removing' : 'Remove staples'}</button></div>
-    </div>
 
     ${missing.length ? `<div class="note" style="margin-top:12px">Still to check this week: <b>${esc(missing.join(', '))}</b></div>`
     : '<button class="btn primary block" data-tab="plan">All places checked — plan the menu</button>'}`;
@@ -754,9 +762,29 @@ const actions = {
   'left-toss': (el) => { const l = state.leftovers.find((x) => x.id === el.dataset.id); logWaste(l.name, 'leftovers'); state.leftovers = state.leftovers.filter((x) => x !== l); commit(); },
   'fresh-done': (el) => { state.fresh = state.fresh.filter((x) => x.id !== el.dataset.id); commit(); },
   'fresh-toss': (el) => { const f = state.fresh.find((x) => x.id === el.dataset.id); logWaste(f.name, 'fresh'); state.fresh = state.fresh.filter((x) => x !== f); commit(); },
-  'staple-toggle': (el) => { const s = state.staples.find((x) => x.id === el.dataset.id); s.low = !s.low; commit(); },
-  'staple-del': (el) => { state.staples = state.staples.filter((x) => x.id !== el.dataset.id); commit(); },
-  'staple-edit': () => { ui.editStaples = !ui.editStaples; render(); },
+  'staple-count': (el) => { const s = state.staples.find((x) => x.id === el.dataset.id); s.have = Math.max(0, s.have + Number(el.dataset.n)); commit(); },
+  'staple-open': (el) => {
+    const s = state.staples.find((x) => x.id === el.dataset.id);
+    openDialog(`
+      <form data-form="dialog">
+        <h3>Staple</h3>
+        <label>Name</label><input type="text" name="name" required value="${esc(s.name)}">
+        <label>Safety stock — how many to always keep on hand</label>
+        <input type="number" name="target" min="1" max="99" value="${s.target}" inputmode="numeric">
+        <label>Kept in</label>
+        <select name="loc">${locs().map((l) => `<option ${l === s.loc ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+        <p class="muted"><small>When the count drops below this number, the shopping list adds enough to get back to it.</small></p>
+        <div class="actions"><button class="btn primary">Save</button>
+          <button type="button" class="btn danger" data-action="staple-del" data-id="${s.id}">Remove</button>
+          <button type="button" class="btn" data-action="close">Cancel</button></div>
+      </form>`, (f) => {
+      s.name = f.get('name').trim() || s.name;
+      s.cat = guessCat(s.name);
+      s.target = Math.max(1, parseInt(f.get('target'), 10) || 1);
+      s.loc = f.get('loc');
+    });
+  },
+  'staple-del': (el) => { state.staples = state.staples.filter((x) => x.id !== el.dataset.id); closeDialog(); commit(); },
   'loc-check': (el) => { const wk = getWeek(ui.week); wk.checked[el.dataset.loc] = !wk.checked[el.dataset.loc]; commit(); },
   'item-move': (el) => {
     const x = [...state.fresh, ...state.leftovers].find((i) => i.id === el.dataset.id);
@@ -809,6 +837,7 @@ const actions = {
   reset: () => {
     if (!confirm(sync ? 'Erase all recipes, menus and lists for EVERYONE in your household?' : 'Erase all recipes, menus and lists on this device?')) return;
     state = defaults();
+    migrate();
     ui.week = weekStartOf(today());
     closeDialog(); commit();
   },
@@ -823,10 +852,10 @@ const forms = {
   'add-loc-item': (f) => {
     const name = f.get('name').trim(), loc = f.get('loc'), kind = f.get('kind');
     if (!name) return;
-    if (kind === 'left') state.leftovers.push({ id: uid(), name, made: today(), portions: 0, loc });
+    if (kind === 'staple') state.staples.push({ id: uid(), name, cat: guessCat(name), target: 1, have: 1, loc });
+    else if (kind === 'left') state.leftovers.push({ id: uid(), name, made: today(), portions: 0, loc });
     else state.fresh.push({ id: uid(), name, added: today(), loc, kind });
   },
-  'add-staple': (f) => { const name = f.get('name').trim(); state.staples.push({ id: uid(), name, cat: guessCat(name), low: false }); },
 };
 
 // ---------- events ----------
