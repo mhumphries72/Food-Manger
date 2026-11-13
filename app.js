@@ -111,7 +111,7 @@ function defaults() {
     rating: null, madeCount: 0, lastMade: null, planServings: null,
   });
   return {
-    settings: { servings: 4, weekStart: 0 },
+    settings: { servings: 4, weekStart: 0, locations: ['Main fridge', 'Garage fridge', 'Storage room'] },
     recipes: [
       recipe('Sheet-Pan Chicken & Vegetables', 4,
         ['1.5 lb chicken thighs', '1 lb potatoes', '2 carrots', '1 head broccoli', '2 tbsp olive oil', '1 tsp paprika', 'salt'],
@@ -141,22 +141,41 @@ function load() {
   } catch (e) {
     state = defaults();
   }
+  migrate();
 }
+// Fill in anything older saved data (or an imported backup) is missing.
+function migrate() {
+  state.settings = { ...defaults().settings, ...state.settings };
+  if (!Array.isArray(state.settings.locations) || !state.settings.locations.length) state.settings.locations = defaults().settings.locations;
+  const known = new Set(locs());
+  for (const x of [...state.fresh, ...state.leftovers]) if (!known.has(x.loc)) x.loc = locs()[0];
+  for (const x of state.fresh) if (!x.kind) x.kind = 'fresh';
+}
+const locs = () => state.settings.locations;
 function save() { localStorage.setItem(KEY, JSON.stringify(state)); }
 
 const ui = { tab: 'home', week: null, recipeFilter: 'all', q: '', editStaples: false };
 
 function getWeek(start) {
-  if (!state.weeks[start]) state.weeks[start] = { days: Array(7).fill(null), checkDone: false, listBuilt: false, shopped: false };
-  return state.weeks[start];
+  if (!state.weeks[start]) state.weeks[start] = { days: Array(7).fill(null), checked: {}, listBuilt: false, shopped: false };
+  const wk = state.weeks[start];
+  if (!wk.checked) wk.checked = wk.checkDone ? Object.fromEntries(locs().map((l) => [l, true])) : {};
+  return wk;
 }
 const recipeById = (id) => state.recipes.find((r) => r.id === id);
 const plannedServings = (r) => r.planServings || state.settings.servings;
 const weekLabel = (start) => `${shortDate(start)} – ${shortDate(addDays(start, 6))}`;
 
+const perishables = () => state.fresh.filter((f) => f.kind !== 'stock');
+const uncheckedLocs = (wk) => locs().filter((l) => !wk.checked[l]);
+// Anything listed in any location that matches a name (fresh first, then stored).
+function onHand(name) {
+  return perishables().find((f) => sameFood(f.name, name)) || state.fresh.find((f) => sameFood(f.name, name));
+}
+
 // Fresh items a recipe would use up.
 function usesFresh(r) {
-  return state.fresh.filter((f) => r.ingredients.some((i) => sameFood(i.name, f.name)));
+  return perishables().filter((f) => r.ingredients.some((i) => sameFood(i.name, f.name)));
 }
 
 // ---------- shopping list ----------
@@ -186,15 +205,19 @@ function buildList() {
     if (!old) {
       // Shop the kitchen first: assume stocked staples and fresh items already on hand.
       const staple = state.staples.find((s) => sameFood(s.name, e.name));
-      const fresh = state.fresh.find((f) => sameFood(f.name, e.name));
-      if (fresh) { status = 'have'; hint = 'already in the fridge'; }
+      const fresh = onHand(e.name);
+      if (fresh) { status = 'have'; hint = `in the ${fresh.loc}`; }
       else if (staple && !staple.low) { status = 'have'; hint = 'staple in stock'; }
     }
     list.push({ id: old ? old.id : uid(), source: 'plan', status, hint: old ? old.hint : hint, ...e });
   }
   for (const s of state.staples.filter((x) => x.low)) {
-    const covered = list.some((i) => i.status !== 'have' && sameFood(i.name, s.name));
-    if (!covered) list.push({ id: uid(), source: 'staple', stapleId: s.id, key: `staple|${s.id}`, name: s.name, unit: '', qty: null, cat: s.cat, status: 'need', for: [] });
+    const key = `staple|${s.id}`;
+    if (list.some((i) => i.key === key || (i.status !== 'have' && sameFood(i.name, s.name)))) continue;
+    // A spare in another fridge or the storage room beats buying a duplicate.
+    const spare = onHand(s.name);
+    list.push({ id: uid(), source: 'staple', stapleId: s.id, key, name: s.name, unit: '', qty: null, cat: s.cat,
+      status: spare ? 'have' : 'need', hint: spare ? `spare in the ${spare.loc}` : '', for: [] });
   }
   state.list = list;
   wk.listBuilt = true;
@@ -203,8 +226,8 @@ function buildList() {
 function finishShopping() {
   const bought = state.list.filter((i) => i.status === 'bought');
   for (const i of bought) {
-    if (PERISHABLE.has(i.cat) && !state.fresh.some((f) => norm(f.name) === norm(i.name))) {
-      state.fresh.push({ id: uid(), name: i.name, added: today() });
+    if (PERISHABLE.has(i.cat) && !perishables().some((f) => norm(f.name) === norm(i.name))) {
+      state.fresh.push({ id: uid(), name: i.name, added: today(), loc: locs()[0], kind: 'fresh' });
     }
     const s = state.staples.find((x) => x.id === i.stapleId || sameFood(x.name, i.name));
     if (s) s.low = false;
@@ -241,8 +264,9 @@ function dayTitle(d) {
 function viewHome() {
   const wk = getWeek(ui.week);
   const planned = wk.days.filter(Boolean).length;
+  const unchecked = uncheckedLocs(wk);
   const steps = [
-    ['kitchen', 'Kitchen check', 'See what needs using up and which staples are low', wk.checkDone],
+    ['kitchen', 'Kitchen check', unchecked.length ? `Still to check: ${esc(unchecked.join(', '))}` : `All ${locs().length} places checked`, !unchecked.length],
     ['plan', 'Plan the menu', planned ? `${planned} of 7 nights planned` : 'Start with what needs using up', planned >= 5],
     ['list', 'Build the shopping list', 'Made from the menu, minus what you already have', wk.listBuilt],
     ['list', 'Shop', 'Check items off in the store, then tap Finish', wk.shopped],
@@ -270,8 +294,8 @@ function viewHome() {
   }
 
   const urgent = [
-    ...state.leftovers.map((l) => ({ name: l.name, kind: 'Leftovers', days: daysSince(l.made), warn: LEFT_WARN, bad: LEFT_BAD })),
-    ...state.fresh.map((f) => ({ name: f.name, kind: 'Fresh', days: daysSince(f.added), warn: FRESH_WARN, bad: FRESH_BAD })),
+    ...state.leftovers.map((l) => ({ name: l.name, kind: `Leftovers · ${l.loc}`, days: daysSince(l.made), warn: LEFT_WARN, bad: LEFT_BAD })),
+    ...perishables().map((f) => ({ name: f.name, kind: f.loc, days: daysSince(f.added), warn: FRESH_WARN, bad: FRESH_BAD })),
   ].filter((x) => x.days >= x.warn).sort((a, b) => (b.days / b.bad) - (a.days / a.bad));
 
   const month = today().slice(0, 7);
@@ -284,7 +308,7 @@ function viewHome() {
     <h2>Use these first</h2>
     <div class="card tight">
       ${urgent.length ? urgent.slice(0, 6).map((x) => `
-        <div class="row"><div class="grow"><b>${esc(x.name)}</b><span class="sub">${x.kind}</span></div>${ageBadge(x.days, x.warn, x.bad)}</div>`).join('')
+        <div class="row"><div class="grow"><b>${esc(x.name)}</b><span class="sub">${esc(x.kind)}</span></div>${ageBadge(x.days, x.warn, x.bad)}</div>`).join('')
       : '<p class="empty">Nothing is getting old. Nice work.</p>'}
     </div>
     ${urgent.length ? '<button class="btn block" data-tab="kitchen">Open kitchen</button>' : ''}
@@ -310,7 +334,7 @@ function viewPlan() {
   const buffer = wk.days.filter((d) => d && (d.type === 'leftovers' || d.type === 'flex')).length;
   let tip = '';
   if (cooked >= 6 && !buffer) tip = 'Six or more cooked meals and no leftovers or flex night. Plans change — leaving one or two open nights is the easiest way to waste less.';
-  else if (state.fresh.length && !cooked) tip = `You have ${state.fresh.length} fresh item${state.fresh.length === 1 ? '' : 's'} on hand. Recipes that use them are listed first when you pick a meal.`;
+  else if (perishables().length && !cooked) tip = `You have ${perishables().length} fresh item${perishables().length === 1 ? '' : 's'} on hand. Recipes that use them are listed first when you pick a meal.`;
 
   return `
     <div class="weeknav">
@@ -318,6 +342,7 @@ function viewPlan() {
       <b>${weekLabel(ui.week)}</b>
       <button class="btn small" data-action="week" data-n="7">Next &rarr;</button>
     </div>
+    ${uncheckedLocs(wk).length ? `<div class="note">Before planning, check: <b>${esc(uncheckedLocs(wk).join(', '))}</b>. <button class="btn small" data-tab="kitchen">Open kitchen</button></div>` : ''}
     ${tip ? `<div class="note">${tip}</div>` : ''}
     ${wk.days.map((d, i) => {
       const date = addDays(ui.week, i);
@@ -406,37 +431,51 @@ function viewRecipes() {
     <div id="recipe-list">${recipeListHtml()}</div>`;
 }
 
+function itemRow(x, kind) {
+  const sub = kind === 'left'
+    ? `Leftovers${x.portions ? ` · ${x.portions} portion${x.portions === 1 ? '' : 's'}` : ''}`
+    : x.kind === 'stock' ? 'Stored' : 'Fresh';
+  const badge = kind === 'left' ? ageBadge(daysSince(x.made), LEFT_WARN, LEFT_BAD)
+    : x.kind === 'stock' ? '' : ageBadge(daysSince(x.added), FRESH_WARN, FRESH_BAD);
+  const a = kind === 'left' ? 'left' : 'fresh';
+  return `
+    <div class="row"><button class="grow namebtn" data-action="item-move" data-id="${x.id}"><b>${esc(x.name)}</b><span class="sub">${sub}</span></button>
+      ${badge}
+      <button class="btn small" data-action="${a}-done" data-id="${x.id}">${kind === 'left' ? 'Eaten' : 'Used'}</button>
+      <button class="btn small danger" data-action="${a}-toss" data-id="${x.id}">Tossed</button></div>`;
+}
+
 function viewKitchen() {
   const wk = getWeek(ui.week);
-  const fresh = [...state.fresh].sort((a, b) => a.added.localeCompare(b.added));
-  const left = [...state.leftovers].sort((a, b) => a.made.localeCompare(b.made));
+  const missing = locs().filter((l) => !wk.checked[l]);
   return `
-    <div class="note">Once a week, before planning: look through the fridge, add anything that needs using up, and tap the staples you’re low on.</div>
+    <div class="note">Once a week, before planning, walk to <b>every</b> place below. Add what needs using up, note what is stored there, then tick the place off. Tap an item’s name to move it.</div>
 
-    <h2>Leftovers <small>eat within ${LEFT_BAD} days</small></h2>
-    <div class="card tight">
-      ${left.length ? left.map((l) => `
-        <div class="row"><div class="grow"><b>${esc(l.name)}</b>${l.portions ? `<span class="sub">${l.portions} portion${l.portions === 1 ? '' : 's'}</span>` : ''}</div>
-          ${ageBadge(daysSince(l.made), LEFT_WARN, LEFT_BAD)}
-          <button class="btn small" data-action="left-done" data-id="${l.id}">Eaten</button>
-          <button class="btn small danger" data-action="left-toss" data-id="${l.id}">Tossed</button></div>`).join('')
-      : '<p class="empty">No leftovers.</p>'}
-    </div>
-    <form class="inline" data-form="add-left"><input type="text" name="name" placeholder="Add leftovers…" autocomplete="off" required><button class="btn">Add</button></form>
-
-    <h2>Fresh food to use up <small>oldest first</small></h2>
-    <div class="card tight">
-      ${fresh.length ? fresh.map((f) => `
-        <div class="row"><div class="grow"><b>${esc(f.name)}</b></div>
-          ${ageBadge(daysSince(f.added), FRESH_WARN, FRESH_BAD)}
-          <button class="btn small" data-action="fresh-done" data-id="${f.id}">Used</button>
-          <button class="btn small danger" data-action="fresh-toss" data-id="${f.id}">Tossed</button></div>`).join('')
-      : '<p class="empty">Nothing listed. Fresh items you buy are added here automatically when you finish shopping.</p>'}
-    </div>
-    <form class="inline" data-form="add-fresh"><input type="text" name="name" placeholder="Add fresh item…" autocomplete="off" required><button class="btn">Add</button></form>
+    ${locs().map((loc) => {
+      const ok = wk.checked[loc];
+      const left = state.leftovers.filter((x) => x.loc === loc).sort((a, b) => a.made.localeCompare(b.made));
+      const items = state.fresh.filter((x) => x.loc === loc)
+        .sort((a, b) => ((a.kind === 'stock') - (b.kind === 'stock')) || a.added.localeCompare(b.added));
+      const cold = /fridge|freezer/i.test(loc);
+      const opt = (v, label, sel) => `<option value="${v}" ${sel ? 'selected' : ''}>${label}</option>`;
+      return `
+      <h2>${esc(loc)} ${ok ? '<span class="badge">Checked</span>' : '<span class="badge warn">Not checked yet</span>'}</h2>
+      <div class="card tight">
+        ${left.length || items.length ? left.map((x) => itemRow(x, 'left')).join('') + items.map((x) => itemRow(x, 'fresh')).join('')
+        : '<p class="empty">Nothing listed here.</p>'}
+      </div>
+      <form class="inline" data-form="add-loc-item">
+        <input type="hidden" name="loc" value="${esc(loc)}">
+        <input type="text" name="name" placeholder="Add an item…" autocomplete="off" required>
+        <select name="kind" class="kind" aria-label="Kind">${opt('fresh', 'Fresh', cold)}${opt('left', 'Leftovers', false)}${opt('stock', 'Stored', !cold)}</select>
+        <button class="btn">Add</button>
+      </form>
+      <button class="btn block ${ok ? '' : 'primary'}" data-action="loc-check" data-loc="${esc(loc)}">${ok ? `&#10003; ${esc(loc)} checked — undo` : `I’ve looked through the ${esc(loc)}`}</button>`;
+    }).join('')}
 
     <h2>Staples <small>tap the ones running low</small></h2>
     <div class="card">
+      <p class="muted"><small>Only mark a staple low after checking every place. If a spare is listed above, the shopping list will point you to it instead of buying another.</small></p>
       <div class="chips">
         ${state.staples.map((s) => ui.editStaples
           ? `<button class="chip" data-action="staple-del" data-id="${s.id}">${esc(s.name)} &times;</button>`
@@ -446,7 +485,8 @@ function viewKitchen() {
       <div class="actions"><button class="btn small" data-action="staple-edit">${ui.editStaples ? 'Done removing' : 'Remove staples'}</button></div>
     </div>
 
-    <button class="btn ${wk.checkDone ? '' : 'primary'} block" data-action="check-done">${wk.checkDone ? '&#10003; Kitchen check done for this week' : 'Kitchen check done — plan the menu'}</button>`;
+    ${missing.length ? `<div class="note" style="margin-top:12px">Still to check this week: <b>${esc(missing.join(', '))}</b></div>`
+    : '<button class="btn primary block" data-tab="plan">All places checked — plan the menu</button>'}`;
 }
 
 const VIEWS = { home: viewHome, plan: viewPlan, list: viewList, recipes: viewRecipes, kitchen: viewKitchen };
@@ -544,7 +584,7 @@ function cookDialog(week, idx) {
     if (amount === 'less' && d.servings > 1) { r.planServings = d.servings - 1; msg = `Next time this will be planned for ${r.planServings}.`; }
     if (amount === 'more') { r.planServings = d.servings + 1; msg = `Next time this will be planned for ${r.planServings}.`; }
     const portions = parseInt(f.get('portions'), 10) || 0;
-    if (portions > 0) state.leftovers.push({ id: uid(), name: r.name, made: today(), portions });
+    if (portions > 0) state.leftovers.push({ id: uid(), name: r.name, made: today(), portions, loc: locs()[0] });
     const usedIds = new Set(f.getAll('used'));
     state.fresh = state.fresh.filter((x) => !usedIds.has(x.id));
     d.cooked = true;
@@ -605,6 +645,8 @@ function settingsDialog() {
       <input type="number" name="servings" min="1" max="20" value="${state.settings.servings}">
       <label>Week starts on</label>
       <select name="weekStart">${DAYS.map((d, i) => `<option value="${i}" ${i === state.settings.weekStart ? 'selected' : ''}>${d}</option>`).join('')}</select>
+      <label>Places food is kept — one per line, in the order you check them</label>
+      <textarea name="locations" style="min-height:90px">${esc(locs().join('\n'))}</textarea>
       <div class="actions"><button class="btn primary">Save</button><button type="button" class="btn" data-action="close">Cancel</button></div>
       <h2>Your data</h2>
       <p class="muted"><small>Everything is stored on this device only. Export a backup file to keep it safe or to move it to another phone.</small></p>
@@ -617,6 +659,9 @@ function settingsDialog() {
     </form>`, (f) => {
     state.settings.servings = Math.max(1, parseInt(f.get('servings'), 10) || 4);
     state.settings.weekStart = parseInt(f.get('weekStart'), 10) || 0;
+    const places = [...new Set(f.get('locations').split('\n').map((l) => l.trim()).filter(Boolean))];
+    if (places.length) state.settings.locations = places;
+    migrate();
     ui.week = weekStartOf(today());
   });
 }
@@ -696,7 +741,18 @@ const actions = {
   'staple-toggle': (el) => { const s = state.staples.find((x) => x.id === el.dataset.id); s.low = !s.low; commit(); },
   'staple-del': (el) => { state.staples = state.staples.filter((x) => x.id !== el.dataset.id); commit(); },
   'staple-edit': () => { ui.editStaples = !ui.editStaples; render(); },
-  'check-done': () => { const wk = getWeek(ui.week); wk.checkDone = true; ui.tab = 'plan'; commit(); },
+  'loc-check': (el) => { const wk = getWeek(ui.week); wk.checked[el.dataset.loc] = !wk.checked[el.dataset.loc]; commit(); },
+  'item-move': (el) => {
+    const x = [...state.fresh, ...state.leftovers].find((i) => i.id === el.dataset.id);
+    openDialog(`
+      <h3>Where is “${esc(x.name)}”?</h3>
+      <div class="chips">${locs().map((l) => `<button class="chip ${l === x.loc ? 'on' : ''}" data-action="set-loc" data-id="${x.id}" data-loc="${esc(l)}">${esc(l)}</button>`).join('')}</div>
+      <button class="btn block" data-action="close">Cancel</button>`);
+  },
+  'set-loc': (el) => {
+    [...state.fresh, ...state.leftovers].find((i) => i.id === el.dataset.id).loc = el.dataset.loc;
+    closeDialog(); commit();
+  },
 
   export: () => {
     const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
@@ -721,8 +777,12 @@ const forms = {
     if (!p.name) return;
     state.list.push({ id: uid(), source: 'manual', key: `manual|${uid()}`, status: 'need', for: [], ...p });
   },
-  'add-left': (f) => state.leftovers.push({ id: uid(), name: f.get('name').trim(), made: today(), portions: 0 }),
-  'add-fresh': (f) => state.fresh.push({ id: uid(), name: f.get('name').trim(), added: today() }),
+  'add-loc-item': (f) => {
+    const name = f.get('name').trim(), loc = f.get('loc'), kind = f.get('kind');
+    if (!name) return;
+    if (kind === 'left') state.leftovers.push({ id: uid(), name, made: today(), portions: 0, loc });
+    else state.fresh.push({ id: uid(), name, added: today(), loc, kind });
+  },
   'add-staple': (f) => { const name = f.get('name').trim(); state.staples.push({ id: uid(), name, cat: guessCat(name), low: false }); },
 };
 
@@ -760,6 +820,7 @@ document.addEventListener('change', (e) => {
       const data = JSON.parse(reader.result);
       if (!data || !Array.isArray(data.recipes) || !data.settings) throw new Error('bad file');
       state = Object.assign(defaults(), data);
+      migrate();
       ui.week = weekStartOf(today());
       closeDialog(); commit(); toast('Backup imported.');
     } catch (err) { toast('That file is not a Food Manager backup.'); }

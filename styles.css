@@ -202,3 +202,7 @@ dialog h3 { margin: 0 0 8px; }
   z-index: 20; max-width: 90vw; text-align: center;
 }
 #toast.show { opacity: 1; }
+
+.namebtn { background: none; border: 0; padding: 0; text-align: left; }
+select.kind { flex: none; width: auto; }
+.note .btn { margin-left: 4px; }

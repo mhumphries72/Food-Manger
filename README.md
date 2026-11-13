@@ -12,13 +12,16 @@ browser on the device you use it on.
 Pick one planning time each week (for example, Saturday morning) and work down the four steps
 on the Home screen. It takes about 15 minutes.
 
-1. **Kitchen check** — look through the fridge, add anything that needs using up, and tap the
-   staples you are low on. This is the only inventory tracking the app asks for.
+1. **Kitchen check** — walk to every place food is kept (by default the main fridge, the
+   garage fridge and the storage room; edit the list in Settings). In each one, add what needs
+   using up, note spares stored there, and tick the place off. The Menu and Home screens keep
+   reminding you until every place is checked. Then tap the staples you are low on.
 2. **Plan the menu** — pick a meal for each night. Recipes that use up what is already in the
    fridge are listed first. Leave a *leftovers night* and a *flex night* so a changed plan
    does not turn into wasted food.
 3. **Build the shopping list** — ingredients are scaled to the servings you planned, merged,
-   and grouped by store section. Stocked staples and food already in the fridge are left off.
+   and grouped by store section. Stocked staples and food already in any location are left off,
+   with a note saying where the spare is (for example, "spare in the Garage fridge").
 4. **Shop** — check items off in the store and tap *Finish shopping*. Fresh food you bought is
    added to the Kitchen "use up" list automatically.
 
