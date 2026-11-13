@@ -82,6 +82,7 @@ function parseQty(s) {
 
 // "1 1/2 cups rice" -> { qty: 1.5, unit: 'cup', name: 'rice', cat: 'Pantry' }
 function parseIngredient(line) {
+  line = line.replace(/(\d)([½¼¾⅓⅔])/, '$1 $2');
   const m = line.trim().match(/^((?:\d+\/\d+|\d*\.?\d+|[½¼¾⅓⅔])(?:\s+(?:\d+\/\d+|[½¼¾⅓⅔]))?)?\s*(.*)$/);
   const qty = m[1] ? parseQty(m[1]) : null;
   let rest = m[2].trim();
@@ -94,6 +95,39 @@ function parseIngredient(line) {
   }
   return { qty, unit, name: rest, cat: guessCat(rest) };
 }
+// Turn pasted recipe text (from a website, message or note) into a draft recipe.
+function parseRecipeText(text) {
+  const clean = (l) => l.replace(/^[\s•\-–*▢☐□·]+/, '').trim();
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const isIngHead = (l) => /^ingredients?\b.{0,20}$/i.test(l);
+  const isStepHead = (l) => /^(instructions?|directions?|method|steps|preparation|how to make( it)?)\b.{0,20}$/i.test(l);
+  const looksLikeIngredient = (l) => /^[\s•\-–*▢☐□·]*(\d|[½¼¾⅓⅔])/.test(l) && l.length < 70 && !/^\d+[.)]\s/.test(l);
+  const url = (text.match(/https?:\/\/\S+/) || [''])[0];
+  const sv = text.match(/(?:serves|servings?|yields?|makes)\D{0,10}(\d{1,2})/i);
+  const iName = lines.findIndex((l) => !isIngHead(l) && !isStepHead(l) && !/^https?:/i.test(l));
+  const iIng = lines.findIndex(isIngHead), iStep = lines.findIndex(isStepHead);
+  let ing, steps;
+  if (iIng >= 0) {
+    ing = lines.slice(iIng + 1, iStep > iIng ? iStep : lines.length);
+    steps = iStep > iIng ? lines.slice(iStep + 1) : iStep >= 0 ? lines.slice(iStep + 1, iIng) : [];
+  } else {
+    const body = lines.slice(iName + 1).filter((l) => !/^https?:/i.test(l));
+    const cut = iStep > iName ? iStep - iName - 1 : body.length;
+    ing = body.slice(0, cut).filter(looksLikeIngredient);
+    steps = body.filter((l, n) => !(n < cut && looksLikeIngredient(l)) && !isStepHead(l));
+  }
+  const end = steps.findIndex((l) => /^nutrition\b/i.test(l));
+  if (end >= 0) steps = steps.slice(0, end);
+  return {
+    name: iName >= 0 ? clean(lines[iName]).slice(0, 80) : '',
+    servings: sv ? Math.max(1, parseInt(sv[1], 10)) : state.settings.servings,
+    ingredients: ing.map(clean).filter((l) => l && !/:$/.test(l) && !/^https?:/i.test(l)).map(parseIngredient),
+    steps: steps.join('\n'),
+    source: url,
+  };
+}
+const splitItems = (text) => String(text).split(/[,;\n]+/).map((x) => x.trim()).filter(Boolean);
+
 const ingredientLine = (i) => [fmtQty(i.qty), i.unit, i.name].filter(Boolean).join(' ');
 
 // Loose match between an ingredient and something on hand ("spinach" ~ "baby spinach").
@@ -130,6 +164,7 @@ function defaults() {
     staples: ['Milk', 'Eggs', 'Butter', 'Bread', 'Rice', 'Pasta', 'Olive oil', 'Onions', 'Garlic', 'Salt',
       'Flour', 'Sugar', 'Coffee', 'Cereal'].map(staple),
     wasteLog: [],
+    freq: {},
   };
 }
 
@@ -394,9 +429,10 @@ function viewList() {
 
   return `
     <form class="inline" data-form="add-item">
-      <input type="text" name="name" placeholder="Add an item…" autocomplete="off" required>
+      <input type="text" name="name" placeholder="Add items — commas between several" autocomplete="off" required>
       <button class="btn primary">Add</button>
     </form>
+    ${frequentItems().length ? `<div class="chips" style="margin-top:8px">${frequentItems().map((n) => `<button class="chip" data-action="quick-add" data-name="${esc(n)}">+ ${esc(n)}</button>`).join('')}</div>` : ''}
     <div class="actions">
       <button class="btn small" data-action="build-list">Rebuild from menu (${weekLabel(ui.week)})</button>
       <button class="btn small" data-action="share-list">Share / copy</button>
@@ -492,7 +528,7 @@ function viewKitchen() {
       </div>` : ''}
       <form class="inline" data-form="add-loc-item">
         <input type="hidden" name="loc" value="${esc(loc)}">
-        <input type="text" name="name" placeholder="Add an item…" autocomplete="off" required>
+        <input type="text" name="name" placeholder="Add items — commas between several" autocomplete="off" required>
         <select name="kind" class="kind" aria-label="Kind">${opt('fresh', 'Fresh', cold)}${opt('left', 'Leftovers', false)}${opt('stock', 'Stored', !cold)}${opt('staple', 'Staple', false)}</select>
         <button class="btn">Add</button>
       </form>
@@ -624,17 +660,34 @@ function recipeDialog(id) {
     </div>`);
 }
 
-function recipeForm(id) {
+function pasteRecipeDialog() {
+  openDialog(`
+    <h3>Paste a recipe</h3>
+    <p class="muted"><small>Copy the recipe from a website, message or note and paste all of it here. You can check and fix it before saving.</small></p>
+    <textarea id="paste-text" style="min-height:220px" placeholder="Paste the recipe text…"></textarea>
+    <div class="actions"><button class="btn primary" id="paste-go">Read recipe</button><button class="btn" data-action="close">Cancel</button></div>`);
+  $('#paste-go').onclick = () => {
+    const text = $('#paste-text').value;
+    if (!text.trim()) return toast('Paste the recipe text first.');
+    const draft = parseRecipeText(text);
+    recipeForm(null, draft);
+    toast(draft.ingredients.length ? `Found ${draft.ingredients.length} ingredients. Check them over, then save.` : 'No ingredients found. Add them by hand.');
+  };
+}
+
+function recipeForm(id, draft) {
   const r = id ? recipeById(id) : null;
+  const v = r || draft;
   openDialog(`
     <form data-form="dialog">
-      <h3>${r ? 'Edit recipe' : 'New recipe'}</h3>
-      <label>Name</label><input type="text" name="name" required value="${esc(r ? r.name : '')}">
-      <label>Servings the recipe makes</label><input type="number" name="servings" min="1" max="40" required value="${r ? r.servings : state.settings.servings}">
+      <h3>${r ? 'Edit recipe' : draft ? 'Check the recipe' : 'New recipe'}</h3>
+      ${v ? '' : '<button type="button" class="btn block" data-action="paste-recipe" style="margin:0 0 6px">Paste a recipe instead of typing</button>'}
+      <label>Name</label><input type="text" name="name" required value="${esc(v ? v.name : '')}">
+      <label>Servings the recipe makes</label><input type="number" name="servings" min="1" max="40" required value="${v ? v.servings : state.settings.servings}">
       <label>Ingredients — one per line, amount first (e.g. “2 cups rice”)</label>
-      <textarea name="ingredients">${esc(r ? r.ingredients.map(ingredientLine).join('\n') : '')}</textarea>
-      <label>Method / notes</label><textarea name="steps">${esc(r ? r.steps : '')}</textarea>
-      <label>Source (link or cookbook page)</label><input type="text" name="source" value="${esc(r ? r.source : '')}">
+      <textarea name="ingredients">${esc(v ? v.ingredients.map(ingredientLine).join('\n') : '')}</textarea>
+      <label>Method / notes</label><textarea name="steps">${esc(v ? v.steps : '')}</textarea>
+      <label>Source (link or cookbook page)</label><input type="text" name="source" value="${esc(v ? v.source : '')}">
       <div class="actions"><button class="btn primary">Save</button><button type="button" class="btn" data-action="close">Cancel</button></div>
     </form>`, (f) => {
     const old = new Map((r ? r.ingredients : []).map((i) => [norm(i.name), i.cat]));
@@ -748,6 +801,8 @@ const actions = {
 
   'recipe-filter': (el) => { ui.recipeFilter = el.dataset.id; render(); },
   'new-recipe': () => recipeForm(null),
+  'paste-recipe': () => pasteRecipeDialog(),
+  'quick-add': (el) => { addListItem(el.dataset.name); commit(); },
   'view-recipe': (el) => recipeDialog(el.dataset.id),
   'edit-recipe': (el) => recipeForm(el.dataset.id),
   'delete-recipe': (el) => {
@@ -844,18 +899,30 @@ const actions = {
 };
 
 const forms = {
-  'add-item': (f) => {
-    const p = parseIngredient(f.get('name'));
-    if (!p.name) return;
-    state.list.push({ id: uid(), source: 'manual', key: `manual|${uid()}`, status: 'need', for: [], ...p });
-  },
-  'add-loc-item': (f) => {
-    const name = f.get('name').trim(), loc = f.get('loc'), kind = f.get('kind');
-    if (!name) return;
+  'add-item': (f) => splitItems(f.get('name')).forEach(addListItem),
+  'add-loc-item': (f) => splitItems(f.get('name')).forEach((name) => addLocItem(name, f.get('loc'), f.get('kind'))),
+};
+
+// Add a hand-typed item to the shopping list and remember it for one-tap repeats.
+function addListItem(text) {
+  const p = parseIngredient(text);
+  if (!p.name) return;
+  state.list.push({ id: uid(), source: 'manual', key: `manual|${uid()}`, status: 'need', for: [], ...p });
+  const k = norm(p.name);
+  state.freq[k] = { name: p.name, n: ((state.freq[k] || {}).n || 0) + 1 };
+}
+// The items typed most often that are not already on the list.
+function frequentItems() {
+  const onList = new Set(state.list.map((i) => norm(i.name)));
+  return Object.entries(state.freq).filter(([k]) => !onList.has(k)).sort((a, b) => b[1].n - a[1].n).slice(0, 8).map(([, v]) => v.name);
+}
+
+const addLocItem = (name, loc, kind) => {
+  {
     if (kind === 'staple') state.staples.push({ id: uid(), name, cat: guessCat(name), target: 1, have: 1, loc });
     else if (kind === 'left') state.leftovers.push({ id: uid(), name, made: today(), portions: 0, loc });
     else state.fresh.push({ id: uid(), name, added: today(), loc, kind });
-  },
+  }
 };
 
 // ---------- events ----------
@@ -878,6 +945,15 @@ document.addEventListener('submit', (e) => {
     forms[form.dataset.form](data);
   }
   commit();
+});
+
+// Pasting a multi-line list into an add box: keep the lines apart so each becomes its own item.
+document.addEventListener('paste', (e) => {
+  const input = e.target.closest('[data-form="add-item"] input[name=name], [data-form="add-loc-item"] input[name=name]');
+  const text = input && e.clipboardData ? e.clipboardData.getData('text') : '';
+  if (!/\n/.test(text)) return;
+  e.preventDefault();
+  input.value = [input.value.trim(), ...splitItems(text)].filter(Boolean).join(', ');
 });
 
 document.addEventListener('input', (e) => {
@@ -905,7 +981,7 @@ document.addEventListener('change', (e) => {
 // /households/<code>. Strings round-trip exactly, and syncing per section means two people
 // editing different things (say, the list and a recipe) never overwrite each other.
 const SYNC_KEY = 'foodmanager.sync';
-const SECTIONS = ['settings', 'recipes', 'weeks', 'list', 'fresh', 'leftovers', 'staples', 'wasteLog'];
+const SECTIONS = ['settings', 'recipes', 'weeks', 'list', 'fresh', 'leftovers', 'staples', 'wasteLog', 'freq'];
 let sync = null;            // { url, code, client, dirty: [sections changed here but not yet uploaded] }
 const pushed = {};          // section -> JSON last known to match the server
 let stream = null, syncReady = false, flushing = false;

@@ -42,6 +42,16 @@ During the week:
   leftovers you saved.
 - Tap **Tossed** when something is thrown out. The monthly count on Home is your scoreboard.
 
+## Adding things quickly
+
+- **Paste a recipe**: in Recipes tap *New*, then *Paste a recipe instead of typing*. Paste the
+  whole recipe text copied from a website, message or note; the app picks out the name,
+  servings, ingredients, method and link for you to check before saving.
+- **Add several items at once**: in the shopping list or a Kitchen place, type or dictate items
+  with commas between them ("milk, eggs, 2 lb chicken"), or paste a list with one item per line.
+- **One-tap repeats**: the items you type into the shopping list most often appear as buttons
+  under the add box whenever they are not already on the list.
+
 ## Setting it up
 
 ### 1. Publish the app with GitHub Pages
