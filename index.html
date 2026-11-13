@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#2f6f4f">
+  <title>Food Manager</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="top">
+    <h1 id="title">Food Manager</h1>
+    <span class="sync off" id="sync-status"></span>
+    <button class="icon-btn" data-action="settings" aria-label="Settings">&#9881;</button>
+  </header>
+
+  <main id="main"></main>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="home"><span>&#8962;</span>Home</button>
+    <button data-tab="plan"><span>&#128197;</span>Menu</button>
+    <button data-tab="list"><span>&#128722;</span>List</button>
+    <button data-tab="recipes"><span>&#128214;</span>Recipes</button>
+    <button data-tab="kitchen"><span>&#129482;</span>Kitchen</button>
+  </nav>
+
+  <dialog id="dialog"></dialog>
+  <div id="toast" role="status"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
